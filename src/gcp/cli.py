@@ -26,22 +26,32 @@ from .config import (
     set_account,
     users_for_host,
 )
-from .github import GitHubClient, GitHubError, parse_repo
+from .github import GitHubClient, GitHubError, NotFound, parse_repo
 from .oauth import OAuthError, login_with_browser
 
 HELP = """GitHub-backed file sync.
 
 Usage:
   uvx gcp setting [login|logout|status|repo] [options]
-  uvx gcp push FILE [options]
   uvx gcp FILE [options]
+  uvx gcp LOCAL_FILE :REMOTE_PATH [options]
+  uvx gcp :REMOTE_PATH LOCAL_FILE [options]
   uvx gcp status
 
 Commands:
   setting          Configure GitHub auth and the target repository
-  push FILE        Upload a local file to GitHub
-  FILE             Download a GitHub file to the local path
   status           Show current auth/repository settings
+
+Remote paths:
+  :path                 Path inside the configured GitHub repository
+  repo:path             Path inside a repo under the configured owner
+  owner/repo:path       Path inside an explicit GitHub repository
+  github:path, gh:path  Aliases for :path
+
+Examples:
+  uvx gcp README.md
+  uvx gcp README.md :README.md
+  uvx gcp :README.md README.md
 
 Run `uvx gcp <command> --help` for command options.
 """
@@ -61,6 +71,13 @@ class SyncContext:
     remote_dir: str
     token_source: str
     account: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class CopyTarget:
+    kind: str
+    path: str
+    repo: str = ""
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -86,57 +103,59 @@ def run(argv: list[str]) -> int:
     command = argv[0]
     if command == "setting":
         return run_setting(argv[1:])
-    if command == "push":
-        return run_push(argv[1:])
     if command == "status":
         return run_status(argv[1:])
 
-    return run_pull(argv)
+    return run_copy(argv)
 
 
-def run_push(argv: list[str]) -> int:
-    parser = command_parser(prog="gcp push", description="Upload a local file to GitHub.")
-    parser.add_argument("file_name", help="Local file to upload")
+def run_copy(argv: list[str]) -> int:
+    parser = command_parser(prog="gcp", description="Copy one file between local disk and a configured GitHub repository.")
+    parser.add_argument("source", help="Source path. Use :path, repo:path, or owner/repo:path for GitHub")
+    parser.add_argument("destination", nargs="?", help="Destination path. Use :path, repo:path, or owner/repo:path for GitHub")
     add_context_flags(parser)
-    parser.add_argument("--remote-path", help="GitHub repository path to write to (defaults to FILE)")
-    parser.add_argument("-m", "--message", help="Commit message")
-    args = parser.parse_args(argv)
-
-    local_path = Path(args.file_name).expanduser()
-    if not local_path.exists():
-        raise UserError(f"local file does not exist: {local_path}")
-    if not local_path.is_file():
-        raise UserError(f"local path is not a file: {local_path}")
-
-    ctx = resolve_context(args)
-    remote_path = build_remote_path(args.file_name, args.remote_path, ctx.remote_dir)
-    message = args.message or f"gcp: sync {remote_path}"
-
-    client = GitHubClient(ctx.token, ctx.host)
-    result = client.put_file(ctx.repo, remote_path, local_path.read_bytes(), message=message, branch=ctx.branch)
-    commit = result.get("commit", {}) if isinstance(result, dict) else {}
-    short_sha = str(commit.get("sha", ""))[:7]
-    suffix = f" @ {short_sha}" if short_sha else ""
-    print(f"✓ Pushed {local_path} to {ctx.repo}:{remote_path} on {ctx.branch}{suffix}")
-    return 0
-
-
-def run_pull(argv: list[str]) -> int:
-    parser = command_parser(prog="gcp", description="Download a GitHub file to a local path.")
-    parser.add_argument("file_name", help="File path to download from GitHub and write locally")
-    add_context_flags(parser)
-    parser.add_argument("--remote-path", help="GitHub repository path to read from (defaults to FILE)")
-    parser.add_argument("-o", "--output", help="Local output file or existing directory")
+    parser.add_argument("-m", "--message", help="Commit message for local-to-GitHub copies")
     parser.add_argument("-f", "--force", action="store_true", help="Overwrite local changes without prompting")
     args = parser.parse_args(argv)
 
+    source, destination = infer_copy_args(args.source, args.destination)
+    src = parse_copy_target(source)
+    dst = parse_copy_target(destination)
+    if src.kind == dst.kind:
+        raise UserError("copy must be between a local path and a GitHub path")
+
     ctx = resolve_context(args)
-    remote_path = build_remote_path(args.file_name, args.remote_path, ctx.remote_dir)
-
     client = GitHubClient(ctx.token, ctx.host)
-    content, _metadata = client.download_file(ctx.repo, remote_path, ref=ctx.branch)
 
-    output_path = output_path_for(args.file_name, args.output)
+    if src.kind == "local" and dst.kind == "github":
+        local_path = Path(src.path).expanduser()
+        if not local_path.exists():
+            raise UserError(f"local file does not exist: {local_path}")
+        if not local_path.is_file():
+            raise UserError(f"local path is not a file: {local_path}")
+        remote_repo = resolve_remote_repo(ctx.repo, dst.repo)
+        remote_path = build_remote_path(dst.path, None, ctx.remote_dir)
+        local_content = local_path.read_bytes()
+        try:
+            remote_content, _metadata = client.download_file(remote_repo, remote_path, ref=ctx.branch)
+            if remote_content == local_content:
+                print(f"✓ No changes for {remote_repo}:{remote_path} on {ctx.branch}")
+                return 0
+        except NotFound:
+            pass
+
+        message = args.message or f"gcp: sync {remote_path}"
+        result = client.put_file(remote_repo, remote_path, local_content, message=message, branch=ctx.branch)
+        commit = result.get("commit", {}) if isinstance(result, dict) else {}
+        short_sha = str(commit.get("sha", ""))[:7]
+        suffix = f" @ {short_sha}" if short_sha else ""
+        print(f"✓ Copied {local_path} to {remote_repo}:{remote_path} on {ctx.branch}{suffix}")
+        return 0
+
+    remote_repo = resolve_remote_repo(ctx.repo, src.repo)
+    remote_path = build_remote_path(src.path, None, ctx.remote_dir)
+    content, _metadata = client.download_file(remote_repo, remote_path, ref=ctx.branch)
+    output_path = output_path_for_remote(dst.path, remote_path)
     if output_path.exists() and output_path.read_bytes() != content and not args.force:
         if can_prompt():
             if not confirm(f"Overwrite local file {output_path}?", default=False):
@@ -146,7 +165,7 @@ def run_pull(argv: list[str]) -> int:
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(content)
-    print(f"✓ Pulled {ctx.repo}:{remote_path} on {ctx.branch} to {output_path}")
+    print(f"✓ Copied {remote_repo}:{remote_path} on {ctx.branch} to {output_path}")
     return 0
 
 
@@ -563,6 +582,59 @@ def build_remote_path(file_name: str, remote_path: Optional[str], remote_dir: st
 
     prefix = normalize_remote_dir(remote_dir)
     return "/".join([prefix] + parts) if prefix else "/".join(parts)
+
+
+def infer_copy_args(source: str, destination: Optional[str]) -> tuple[str, str]:
+    if destination is not None:
+        return source, destination
+    target = parse_copy_target(source)
+    if target.kind == "github":
+        raise UserError("one-argument mode requires a local file path")
+    return source, f":{default_remote_path_for_local(target.path)}"
+
+
+def default_remote_path_for_local(path: str) -> str:
+    expanded = Path(path).expanduser()
+    if expanded.is_absolute():
+        try:
+            return expanded.relative_to(Path.home()).as_posix()
+        except ValueError:
+            return expanded.as_posix().lstrip("/")
+    return path.replace("\\", "/")
+
+
+def parse_copy_target(value: str) -> CopyTarget:
+    if value.startswith("github:"):
+        return CopyTarget("github", value[len("github:") :], "")
+    if value.startswith("gh:"):
+        return CopyTarget("github", value[len("gh:") :], "")
+
+    colon_index = value.find(":")
+    if colon_index >= 0:
+        repo_part = value[:colon_index]
+        path = value[colon_index + 1 :]
+        if repo_part in {"", "github", "gh"}:
+            repo_part = ""
+        return CopyTarget("github", path, repo_part)
+
+    return CopyTarget("local", value)
+
+
+def resolve_remote_repo(default_repo: str, repo_part: str) -> str:
+    if not repo_part:
+        return default_repo
+    if "/" in repo_part:
+        parse_repo(repo_part)
+        return repo_part
+    owner, _repo = parse_repo(default_repo)
+    return f"{owner}/{repo_part}"
+
+
+def output_path_for_remote(destination: str, remote_path: str) -> Path:
+    path = Path(destination).expanduser()
+    if path.exists() and path.is_dir():
+        return path / Path(remote_path).name
+    return path
 
 
 def output_path_for(file_name: str, output: Optional[str]) -> Path:

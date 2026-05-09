@@ -6,7 +6,7 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
-from gcp.cli import UserError, build_remote_path, output_path_for, run
+from gcp.cli import UserError, build_remote_path, default_remote_path_for_local, infer_copy_args, output_path_for, parse_copy_target, resolve_remote_repo, run
 from gcp.config import load_config, save_config, set_account
 
 
@@ -48,6 +48,50 @@ class PathTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             self.assertEqual(output_path_for("notes/today.md", directory), Path(directory) / "today.md")
 
+    def test_parse_copy_target_github(self):
+        self.assertEqual(parse_copy_target("github:README.md").kind, "github")
+        self.assertEqual(parse_copy_target("github:README.md").path, "README.md")
+        self.assertEqual(parse_copy_target("gh:README.md").path, "README.md")
+        self.assertEqual(parse_copy_target(":README.md").path, "README.md")
+        self.assertEqual(parse_copy_target(":README.md").repo, "")
+
+    def test_parse_copy_target_repo_prefix(self):
+        target = parse_copy_target("privatee:README.md")
+        self.assertEqual(target.kind, "github")
+        self.assertEqual(target.repo, "privatee")
+        self.assertEqual(target.path, "README.md")
+
+    def test_parse_copy_target_full_repo_prefix(self):
+        target = parse_copy_target("doehyunbaekk/privatee:README.md")
+        self.assertEqual(target.kind, "github")
+        self.assertEqual(target.repo, "doehyunbaekk/privatee")
+        self.assertEqual(target.path, "README.md")
+
+    def test_parse_copy_target_local(self):
+        target = parse_copy_target("README.md")
+        self.assertEqual(target.kind, "local")
+        self.assertEqual(target.path, "README.md")
+
+    def test_resolve_remote_repo(self):
+        self.assertEqual(resolve_remote_repo("doehyunbaek/private", ""), "doehyunbaek/private")
+        self.assertEqual(resolve_remote_repo("doehyunbaek/private", "privatee"), "doehyunbaek/privatee")
+        self.assertEqual(resolve_remote_repo("doehyunbaek/private", "doehyunbaekk/privatee"), "doehyunbaekk/privatee")
+
+    def test_default_remote_path_for_home_file(self):
+        local = str(Path.home() / ".pi" / "agent" / "multicodex.json")
+        self.assertEqual(default_remote_path_for_local(local), ".pi/agent/multicodex.json")
+
+    def test_infer_one_arg_push(self):
+        self.assertEqual(infer_copy_args("README.md", None), ("README.md", ":README.md"))
+
+    def test_infer_one_arg_push_home_relative(self):
+        local = str(Path.home() / ".pi" / "agent" / "multicodex.json")
+        self.assertEqual(infer_copy_args(local, None), (local, ":.pi/agent/multicodex.json"))
+
+    def test_infer_one_arg_rejects_github_source(self):
+        with self.assertRaises(UserError):
+            infer_copy_args("github:README.md", None)
+
 
 class ConfigTests(unittest.TestCase):
     def test_save_and_load_account(self):
@@ -87,7 +131,7 @@ class CliTests(unittest.TestCase):
         with redirect_stdout(output):
             code = run(["--help"])
         self.assertEqual(code, 0)
-        self.assertIn("uvx gcp push FILE", output.getvalue())
+        self.assertIn("uvx gcp LOCAL_FILE :REMOTE_PATH", output.getvalue())
 
 
 if __name__ == "__main__":

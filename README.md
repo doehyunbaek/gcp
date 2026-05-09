@@ -7,12 +7,20 @@
 ```bash
 uvx gcp setting                 # interactive login/logout/status/repo settings
 uvx gcp setting login           # non-interactive login options are also available
-uvx gcp push <file_name>        # upload local file to GitHub
-uvx gcp <file_name>             # download GitHub file to local path
+uvx gcp <file>                  # upload only if local differs from GitHub
+uvx gcp <local> :<remote>       # upload to default repo if different
+uvx gcp :<remote> <local>       # download from default repo
 uvx gcp status                  # show current settings
 ```
 
-`uvx gcp <file_name>` pulls by default. `uvx gcp push <file_name>` pushes.
+GitHub paths use scp-like prefixes:
+
+- `:path` uses the configured default repo, e.g. `doehyunbaek/private:path`
+- `repo:path` uses a repo under the default owner, e.g. `privatee:path` -> `doehyunbaek/privatee:path`
+- `owner/repo:path` uses an explicit repo, e.g. `doehyunbaekk/privatee:path`
+- `github:path` and `gh:path` are aliases for `:path`
+
+In one-argument mode, paths under your home directory keep their home-relative path; for example `~/.pi/agent/multicodex.json` syncs to `.pi/agent/multicodex.json`.
 
 ## Setup flow
 
@@ -40,15 +48,18 @@ uv run --project . gcp setting login --web -r owner/repo -b main
 # Store a token from stdin and configure a repo
 printf '%s' "$GH_TOKEN" | uv run --project . gcp setting login --with-token -r owner/repo -b main
 
-# Push README.md to owner/repo:README.md
-uv run --project . gcp push README.md
+# Push README.md to owner/repo:README.md only if different
+uv run --project . gcp README.md
+
+# Push to an explicit remote path
+uv run --project . gcp README.md :README.md
 
 # Pull README.md from GitHub to ./README.md
-uv run --project . gcp README.md --force
+uv run --project . gcp :README.md README.md --force
 
-# Use a different remote path
-uv run --project . gcp push local.txt --remote-path notes/local.txt
-uv run --project . gcp local.txt --remote-path notes/local.txt
+# Short forms
+uv run --project . gcp local.txt privatee:notes/local.txt
+uv run --project . gcp doehyunbaekk/privatee:notes/local.txt local.txt
 ```
 
 ## Configuration

@@ -1,6 +1,6 @@
 [project]
 name = "gcp"
-version = "0.1.1"
+version = "0.3.0"
 description = "A uvx-friendly CLI for syncing local files with GitHub repository files"
 readme = "README.md"
 requires-python = ">=3.9"
