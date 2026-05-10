@@ -88,9 +88,13 @@ class PathTests(unittest.TestCase):
         local = str(Path.home() / ".pi" / "agent" / "multicodex.json")
         self.assertEqual(infer_copy_args(local, None), (local, ":.pi/agent/multicodex.json"))
 
-    def test_infer_one_arg_rejects_github_source(self):
-        with self.assertRaises(UserError):
-            infer_copy_args("github:README.md", None)
+    def test_infer_one_arg_github_source_downloads_to_same_path(self):
+        self.assertEqual(infer_copy_args(":README.md", None), (":README.md", "README.md"))
+
+    def test_infer_one_arg_github_home_source_downloads_to_home_path(self):
+        source, destination = infer_copy_args(":~/.pi/agent/multicodex.json", None)
+        self.assertEqual(source, ":.pi/agent/multicodex.json")
+        self.assertEqual(destination, str(Path.home() / ".pi" / "agent" / "multicodex.json"))
 
 
 class ConfigTests(unittest.TestCase):
@@ -125,6 +129,55 @@ class CliTests(unittest.TestCase):
                 code = run(["status"])
             self.assertEqual(code, 0)
             self.assertIn("Not logged in", output.getvalue())
+
+    def test_setting_branch_updates_active_account(self):
+        with isolated_config_dir():
+            config = load_config()
+            set_account(
+                config,
+                "github.com",
+                "octocat",
+                token="ghp_secret",
+                repo="octo/repo",
+                branch="main",
+                remote_dir="docs",
+                token_source="config",
+            )
+            save_config(config)
+
+            output = StringIO()
+            with redirect_stdout(output):
+                code = run(["setting", "branch", "feature"])
+
+            self.assertEqual(code, 0)
+            account = load_config()["hosts"]["github.com"]["users"]["octocat"]
+            self.assertEqual(account["branch"], "feature")
+            self.assertEqual(account["repo"], "octo/repo")
+            self.assertEqual(account["remote_dir"], "docs")
+            self.assertIn("Branch set to feature", output.getvalue())
+
+    def test_setting_branch_accepts_flag(self):
+        with isolated_config_dir():
+            config = load_config()
+            set_account(
+                config,
+                "github.com",
+                "octocat",
+                token=None,
+                repo="octo/repo",
+                branch="main",
+                remote_dir="",
+                token_source="env",
+            )
+            save_config(config)
+
+            output = StringIO()
+            with redirect_stdout(output):
+                code = run(["setting", "branch", "--branch", "develop"])
+
+            self.assertEqual(code, 0)
+            account = load_config()["hosts"]["github.com"]["users"]["octocat"]
+            self.assertEqual(account["branch"], "develop")
 
     def test_root_help(self):
         output = StringIO()

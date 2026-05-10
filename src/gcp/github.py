@@ -95,6 +95,36 @@ class GitHubClient:
         owner, name = parse_repo(repo)
         return self._request("GET", f"/repos/{quote(owner)}/{quote(name)}")
 
+    def get_ref(self, repo: str, ref: str) -> Dict[str, Any]:
+        owner, name = parse_repo(repo)
+        return self._request("GET", f"/repos/{quote(owner)}/{quote(name)}/git/ref/{quote(ref, safe='/')}")
+
+    def create_ref(self, repo: str, ref: str, sha: str) -> Dict[str, Any]:
+        owner, name = parse_repo(repo)
+        return self._request(
+            "POST",
+            f"/repos/{quote(owner)}/{quote(name)}/git/refs",
+            {"ref": ref, "sha": sha},
+        )
+
+    def ensure_branch(self, repo: str, branch: str) -> None:
+        branch = branch.strip()
+        if not branch:
+            return
+        try:
+            self.get_ref(repo, f"heads/{branch}")
+            return
+        except NotFound:
+            pass
+
+        repo_data = self.get_repository(repo)
+        default_branch = str(repo_data.get("default_branch") or "main")
+        default_ref = self.get_ref(repo, f"heads/{default_branch}")
+        sha = str(default_ref.get("object", {}).get("sha") or "")
+        if not sha:
+            raise GitHubError(f"could not determine sha for default branch {default_branch} in {repo}")
+        self.create_ref(repo, f"refs/heads/{branch}", sha)
+
     def get_contents(self, repo: str, path: str, *, ref: Optional[str] = None) -> Any:
         owner, name = parse_repo(repo)
         path = quote(path.strip("/"), safe="/")
@@ -125,6 +155,8 @@ class GitHubClient:
         branch: Optional[str] = None,
     ) -> Dict[str, Any]:
         owner, name = parse_repo(repo)
+        if branch:
+            self.ensure_branch(repo, branch)
         normalized_path = path.strip("/")
         route_path = quote(normalized_path, safe="/")
         route = f"/repos/{quote(owner)}/{quote(name)}/contents/{route_path}"

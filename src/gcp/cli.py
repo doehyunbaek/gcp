@@ -32,7 +32,7 @@ from .oauth import OAuthError, login_with_browser
 HELP = """GitHub-backed file sync.
 
 Usage:
-  uvx gcp setting [login|logout|status|repo] [options]
+  uvx gcp setting [login|logout|status|repo|branch] [options]
   uvx gcp FILE [options]
   uvx gcp LOCAL_FILE :REMOTE_PATH [options]
   uvx gcp :REMOTE_PATH LOCAL_FILE [options]
@@ -208,6 +208,13 @@ def run_setting(argv: list[str]) -> int:
     repo.add_argument("-b", "--branch", help="Branch to sync with")
     repo.add_argument("-d", "--remote-dir", default=None, help="Optional repository directory for synced files")
 
+    branch = subparsers.add_parser("branch", help="Change branch for the active account", add_help=False)
+    add_long_help(branch)
+    branch.add_argument("branch", nargs="?", help="Branch to sync with")
+    branch.add_argument("-h", "--hostname", help="GitHub hostname")
+    branch.add_argument("-u", "--user", help="GitHub username")
+    branch.add_argument("-b", "--branch-name", dest="branch_name", help="Branch to sync with")
+
     args = parser.parse_args(argv)
 
     if args.action == "login":
@@ -219,6 +226,8 @@ def run_setting(argv: list[str]) -> int:
         return 0
     if args.action == "repo":
         return setting_repo(args)
+    if args.action == "branch":
+        return setting_branch(args)
 
     if can_prompt():
         return interactive_setting()
@@ -350,6 +359,41 @@ def setting_repo(args: argparse.Namespace) -> int:
     return 0
 
 
+def setting_branch(args: argparse.Namespace) -> int:
+    config = load_config()
+    requested_host = getattr(args, "hostname", None)
+    host = normalize_host(requested_host or config.get("current_host") or DEFAULT_HOST)
+    host_cfg = config.get("hosts", {}).get(host, {})
+    requested_user = getattr(args, "user", None)
+    user = requested_user or host_cfg.get("current_user") or ""
+    account = get_user(config, host, user) if user else None
+
+    if account is None:
+        hint = "run `uvx gcp setting` first"
+        if requested_host:
+            raise UserError(f"not logged in to {host}; {hint}")
+        raise UserError(f"not logged in; {hint}")
+
+    branch = getattr(args, "branch_name", None) or getattr(args, "branch", None)
+    branch = branch or prompt_text("Branch", default=str(account.get("branch") or DEFAULT_BRANCH), required=True)
+    if not str(branch).strip():
+        raise UserError("branch is required")
+
+    set_account(
+        config,
+        host,
+        str(user),
+        token=account.get("token"),
+        repo=str(account.get("repo") or ""),
+        branch=str(branch).strip(),
+        remote_dir=str(account.get("remote_dir") or ""),
+        token_source=str(account.get("token_source") or ("config" if account.get("token") else "env")),
+    )
+    save_config(config)
+    print(f"✓ Branch set to {str(branch).strip()}")
+    return 0
+
+
 def interactive_setting() -> int:
     print("GitHub-backed file sync settings\n")
     choices = [
@@ -357,6 +401,7 @@ def interactive_setting() -> int:
         "Log out of a GitHub account",
         "Show current status",
         "Change repository/branch",
+        "Change branch only",
         "Exit",
     ]
     selected = select("What would you like to do?", choices)
@@ -372,6 +417,9 @@ def interactive_setting() -> int:
     if selected == 3:
         args = argparse.Namespace(hostname=None, user=None, repo=None, branch=None, remote_dir=None)
         return setting_repo(args)
+    if selected == 4:
+        args = argparse.Namespace(hostname=None, user=None, branch=None, branch_name=None)
+        return setting_branch(args)
     return 0
 
 
@@ -589,8 +637,22 @@ def infer_copy_args(source: str, destination: Optional[str]) -> tuple[str, str]:
         return source, destination
     target = parse_copy_target(source)
     if target.kind == "github":
-        raise UserError("one-argument mode requires a local file path")
+        remote_path = default_remote_path_for_remote_arg(target.path)
+        remote_source = f"{target.repo}:{remote_path}" if target.repo else f":{remote_path}"
+        return remote_source, default_local_path_for_remote_arg(target.path)
     return source, f":{default_remote_path_for_local(target.path)}"
+
+
+def default_remote_path_for_remote_arg(path: str) -> str:
+    if path.startswith("~/"):
+        return path[2:]
+    return path
+
+
+def default_local_path_for_remote_arg(path: str) -> str:
+    if path.startswith("~/"):
+        return str(Path(path).expanduser())
+    return path
 
 
 def default_remote_path_for_local(path: str) -> str:

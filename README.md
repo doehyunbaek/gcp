@@ -5,8 +5,9 @@
 ## Commands
 
 ```bash
-uvx gcp setting                 # interactive login/logout/status/repo settings
+uvx gcp setting                 # interactive login/logout/status/repo/branch settings
 uvx gcp setting login           # non-interactive login options are also available
+uvx gcp setting branch feature  # change the configured branch for the active account
 uvx gcp <file>                  # upload only if local differs from GitHub
 uvx gcp <local> :<remote>       # upload to default repo if different
 uvx gcp :<remote> <local>       # download from default repo
@@ -20,7 +21,7 @@ GitHub paths use scp-like prefixes:
 - `owner/repo:path` uses an explicit repo, e.g. `doehyunbaekk/privatee:path`
 - `github:path` and `gh:path` are aliases for `:path`
 
-In one-argument mode, paths under your home directory keep their home-relative path; for example `~/.pi/agent/multicodex.json` syncs to `.pi/agent/multicodex.json`.
+In one-argument upload mode, paths under your home directory keep their home-relative path; for example `~/.pi/agent/multicodex.json` syncs to `.pi/agent/multicodex.json`. In one-argument download mode, `:path` copies from the configured repo/branch to `path`; `:~/.pi/agent/multicodex.json` reads `.pi/agent/multicodex.json` from GitHub and writes to `~/.pi/agent/multicodex.json`.
 
 ## Setup flow
 
@@ -47,6 +48,9 @@ uv run --project . gcp setting login --web -r owner/repo -b main
 
 # Store a token from stdin and configure a repo
 printf '%s' "$GH_TOKEN" | uv run --project . gcp setting login --with-token -r owner/repo -b main
+
+# Change only the configured branch
+uv run --project . gcp setting branch feature
 
 # Push README.md to owner/repo:README.md only if different
 uv run --project . gcp README.md
