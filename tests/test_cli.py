@@ -6,8 +6,9 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
-from gcp.cli import UserError, build_remote_path, default_remote_path_for_local, infer_copy_args, output_path_for, parse_copy_target, resolve_remote_repo, run
+from gcp.cli import UserError, build_remote_path, default_remote_path_for_local, infer_copy_args, iter_local_files, output_path_for, parse_copy_target, resolve_remote_repo, run, upload_directory
 from gcp.config import load_config, save_config, set_account
+from gcp.github import NotFound
 
 
 @contextmanager
@@ -95,6 +96,35 @@ class PathTests(unittest.TestCase):
         source, destination = infer_copy_args(":~/.pi/agent/multicodex.json", None)
         self.assertEqual(source, ":.pi/agent/multicodex.json")
         self.assertEqual(destination, str(Path.home() / ".pi" / "agent" / "multicodex.json"))
+
+    def test_iter_local_files_rejects_empty_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(UserError):
+                iter_local_files(Path(directory))
+
+    def test_upload_directory_preserves_relative_paths(self):
+        class FakeClient:
+            def __init__(self):
+                self.uploads = []
+
+            def download_file(self, repo, path, *, ref=None):
+                raise NotFound("missing")
+
+            def put_file(self, repo, path, content, *, message, branch=None):
+                self.uploads.append((repo, path, content, message, branch))
+                return {"commit": {"sha": "abcdef123"}}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "sub").mkdir()
+            (root / "a.txt").write_text("a")
+            (root / "sub" / "b.txt").write_text("b")
+            client = FakeClient()
+
+            uploaded, unchanged = upload_directory(client, "octo/repo", "main", root, "logs", None)
+
+            self.assertEqual((uploaded, unchanged), (2, 0))
+            self.assertEqual([item[1] for item in client.uploads], ["logs/a.txt", "logs/sub/b.txt"])
 
 
 class ConfigTests(unittest.TestCase):
@@ -184,7 +214,7 @@ class CliTests(unittest.TestCase):
         with redirect_stdout(output):
             code = run(["--help"])
         self.assertEqual(code, 0)
-        self.assertIn("uvx gcp LOCAL_FILE :REMOTE_PATH", output.getvalue())
+        self.assertIn("uvx gcp LOCAL_FILE_OR_DIR :REMOTE_PATH", output.getvalue())
 
 
 if __name__ == "__main__":

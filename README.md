@@ -1,6 +1,6 @@
 # Github-backed file sync
 
-`gcp` is a uv/uvx-friendly CLI that syncs individual local files with files in a GitHub repository.
+`gcp` is a uv/uvx-friendly CLI that syncs local files and directories with files in a GitHub repository.
 
 ## Commands
 
@@ -8,8 +8,8 @@
 uvx gcp setting                 # interactive login/logout/status/repo/branch settings
 uvx gcp setting login           # non-interactive login options are also available
 uvx gcp setting branch feature  # change the configured branch for the active account
-uvx gcp <file>                  # upload only if local differs from GitHub
-uvx gcp <local> :<remote>       # upload to default repo if different
+uvx gcp <file-or-dir>           # upload only if local differs from GitHub
+uvx gcp <local-file-or-dir> :<remote>  # upload to default repo if different
 uvx gcp :<remote> <local>       # download from default repo
 uvx gcp status                  # show current settings
 ```
@@ -21,7 +21,7 @@ GitHub paths use scp-like prefixes:
 - `owner/repo:path` uses an explicit repo, e.g. `doehyunbaekk/privatee:path`
 - `github:path` and `gh:path` are aliases for `:path`
 
-In one-argument upload mode, paths under your home directory keep their home-relative path; for example `~/.pi/agent/multicodex.json` syncs to `.pi/agent/multicodex.json`. In one-argument download mode, `:path` copies from the configured repo/branch to `path`; `:~/.pi/agent/multicodex.json` reads `.pi/agent/multicodex.json` from GitHub and writes to `~/.pi/agent/multicodex.json`.
+In one-argument upload mode, paths under your home directory keep their home-relative path; for example `~/.pi/agent/multicodex.json` syncs to `.pi/agent/multicodex.json`. Passing a directory uploads every file under that directory while preserving relative paths. In one-argument download mode, `:path` copies from the configured repo/branch to `path`; `:~/.pi/agent/multicodex.json` reads `.pi/agent/multicodex.json` from GitHub and writes to `~/.pi/agent/multicodex.json`.
 
 ## Setup flow
 
@@ -54,6 +54,9 @@ uv run --project . gcp setting branch feature
 
 # Push README.md to owner/repo:README.md only if different
 uv run --project . gcp README.md
+
+# Push a directory recursively
+uv run --project . gcp ~/AutoGPT
 
 # Push to an explicit remote path
 uv run --project . gcp README.md :README.md

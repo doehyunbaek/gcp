@@ -33,8 +33,8 @@ HELP = """GitHub-backed file sync.
 
 Usage:
   uvx gcp setting [login|logout|status|repo|branch] [options]
-  uvx gcp FILE [options]
-  uvx gcp LOCAL_FILE :REMOTE_PATH [options]
+  uvx gcp FILE_OR_DIR [options]
+  uvx gcp LOCAL_FILE_OR_DIR :REMOTE_PATH [options]
   uvx gcp :REMOTE_PATH LOCAL_FILE [options]
   uvx gcp status
 
@@ -110,7 +110,7 @@ def run(argv: list[str]) -> int:
 
 
 def run_copy(argv: list[str]) -> int:
-    parser = command_parser(prog="gcp", description="Copy one file between local disk and a configured GitHub repository.")
+    parser = command_parser(prog="gcp", description="Copy files between local disk and a configured GitHub repository.")
     parser.add_argument("source", help="Source path. Use :path, repo:path, or owner/repo:path for GitHub")
     parser.add_argument("destination", nargs="?", help="Destination path. Use :path, repo:path, or owner/repo:path for GitHub")
     add_context_flags(parser)
@@ -130,24 +130,19 @@ def run_copy(argv: list[str]) -> int:
     if src.kind == "local" and dst.kind == "github":
         local_path = Path(src.path).expanduser()
         if not local_path.exists():
-            raise UserError(f"local file does not exist: {local_path}")
-        if not local_path.is_file():
-            raise UserError(f"local path is not a file: {local_path}")
+            raise UserError(f"local path does not exist: {local_path}")
         remote_repo = resolve_remote_repo(ctx.repo, dst.repo)
         remote_path = build_remote_path(dst.path, None, ctx.remote_dir)
-        local_content = local_path.read_bytes()
-        try:
-            remote_content, _metadata = client.download_file(remote_repo, remote_path, ref=ctx.branch)
-            if remote_content == local_content:
-                print(f"✓ No changes for {remote_repo}:{remote_path} on {ctx.branch}")
-                return 0
-        except NotFound:
-            pass
-
-        message = args.message or f"gcp: sync {remote_path}"
-        result = client.put_file(remote_repo, remote_path, local_content, message=message, branch=ctx.branch)
-        commit = result.get("commit", {}) if isinstance(result, dict) else {}
-        short_sha = str(commit.get("sha", ""))[:7]
+        if local_path.is_dir():
+            uploaded, unchanged = upload_directory(client, remote_repo, ctx.branch, local_path, remote_path, args.message)
+            print(f"✓ Synced {uploaded} file(s) from {local_path} to {remote_repo}:{remote_path} on {ctx.branch}" + (f" ({unchanged} unchanged)" if unchanged else ""))
+            return 0
+        if not local_path.is_file():
+            raise UserError(f"local path is not a file or directory: {local_path}")
+        changed, short_sha = upload_file_if_changed(client, remote_repo, ctx.branch, local_path, remote_path, args.message)
+        if not changed:
+            print(f"✓ No changes for {remote_repo}:{remote_path} on {ctx.branch}")
+            return 0
         suffix = f" @ {short_sha}" if short_sha else ""
         print(f"✓ Copied {local_path} to {remote_repo}:{remote_path} on {ctx.branch}{suffix}")
         return 0
@@ -611,6 +606,62 @@ def confirm(prompt: str, *, default: bool) -> bool:
         if answer in {"n", "no"}:
             return False
         print("Please answer yes or no.")
+
+
+def iter_local_files(directory: Path) -> list[Path]:
+    files = [path for path in directory.rglob("*") if path.is_file()]
+    files.sort(key=lambda path: path.relative_to(directory).as_posix())
+    if not files:
+        raise UserError(f"local directory contains no files: {directory}")
+    return files
+
+
+def upload_directory(
+    client: GitHubClient,
+    remote_repo: str,
+    branch: str,
+    local_dir: Path,
+    remote_dir: str,
+    message: Optional[str],
+) -> tuple[int, int]:
+    uploaded = 0
+    unchanged = 0
+    for path in iter_local_files(local_dir):
+        rel = path.relative_to(local_dir).as_posix()
+        remote_path = build_remote_path(rel, f"{remote_dir}/{rel}", "")
+        changed, _short_sha = upload_file_if_changed(client, remote_repo, branch, path, remote_path, message)
+        if changed:
+            uploaded += 1
+        else:
+            unchanged += 1
+    return uploaded, unchanged
+
+
+def upload_file_if_changed(
+    client: GitHubClient,
+    remote_repo: str,
+    branch: str,
+    local_path: Path,
+    remote_path: str,
+    message: Optional[str],
+) -> tuple[bool, str]:
+    local_content = local_path.read_bytes()
+    try:
+        remote_content, _metadata = client.download_file(remote_repo, remote_path, ref=branch)
+        if remote_content == local_content:
+            return False, ""
+    except NotFound:
+        pass
+
+    result = client.put_file(
+        remote_repo,
+        remote_path,
+        local_content,
+        message=message or f"gcp: sync {remote_path}",
+        branch=branch,
+    )
+    commit = result.get("commit", {}) if isinstance(result, dict) else {}
+    return True, str(commit.get("sha", ""))[:7]
 
 
 def build_remote_path(file_name: str, remote_path: Optional[str], remote_dir: str = "") -> str:
