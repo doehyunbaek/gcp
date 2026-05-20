@@ -21,7 +21,7 @@ GitHub paths use scp-like prefixes:
 - `owner/repo:path` uses an explicit repo, e.g. `doehyunbaekk/privatee:path`
 - `github:path` and `gh:path` are aliases for `:path`
 
-In one-argument upload mode, paths under your home directory keep their home-relative path; for example `~/.pi/agent/multicodex.json` syncs to `.pi/agent/multicodex.json`. Passing a directory uploads every file under that directory while preserving relative paths. In one-argument download mode, `:path` copies from the configured repo/branch to `path`; `:~/.pi/agent/multicodex.json` reads `.pi/agent/multicodex.json` from GitHub and writes to `~/.pi/agent/multicodex.json`.
+In one-argument upload mode, absolute local paths keep their full path inside the repository without the leading slash; for example `~/.pi/agent/multicodex.json` syncs to `home/you/.pi/agent/multicodex.json`. Passing a directory uploads every file under that directory while preserving relative paths. In one-argument download mode, `:path` copies from the configured repo/branch to an absolute local output path; `:~/.pi/agent/multicodex.json` reads `home/you/.pi/agent/multicodex.json` from GitHub and writes to `~/.pi/agent/multicodex.json`.
 
 ## Setup flow
 

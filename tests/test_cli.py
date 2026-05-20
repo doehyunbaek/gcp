@@ -1,3 +1,4 @@
+import base64
 import os
 import tempfile
 import unittest
@@ -6,9 +7,9 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
-from gcp.cli import UserError, build_remote_path, default_remote_path_for_local, infer_copy_args, iter_local_files, output_path_for, parse_copy_target, resolve_remote_repo, run, upload_directory
+from gcp.cli import UserError, build_remote_path, default_remote_path_for_local, infer_copy_args, iter_local_files, output_path_for, parse_copy_target, resolve_remote_repo, run, upload_directory, upload_file_if_changed
 from gcp.config import load_config, save_config, set_account
-from gcp.github import NotFound
+from gcp.github import GitHubClient, NotFound, git_blob_sha
 
 
 @contextmanager
@@ -80,21 +81,24 @@ class PathTests(unittest.TestCase):
 
     def test_default_remote_path_for_home_file(self):
         local = str(Path.home() / ".pi" / "agent" / "multicodex.json")
-        self.assertEqual(default_remote_path_for_local(local), ".pi/agent/multicodex.json")
+        home_remote = Path.home().as_posix().lstrip("/")
+        self.assertEqual(default_remote_path_for_local(local), f"{home_remote}/.pi/agent/multicodex.json")
 
     def test_infer_one_arg_push(self):
         self.assertEqual(infer_copy_args("README.md", None), ("README.md", ":README.md"))
 
-    def test_infer_one_arg_push_home_relative(self):
+    def test_infer_one_arg_push_absolute_home_path(self):
         local = str(Path.home() / ".pi" / "agent" / "multicodex.json")
-        self.assertEqual(infer_copy_args(local, None), (local, ":.pi/agent/multicodex.json"))
+        home_remote = Path.home().as_posix().lstrip("/")
+        self.assertEqual(infer_copy_args(local, None), (local, f":{home_remote}/.pi/agent/multicodex.json"))
 
     def test_infer_one_arg_github_source_downloads_to_same_path(self):
         self.assertEqual(infer_copy_args(":README.md", None), (":README.md", "README.md"))
 
     def test_infer_one_arg_github_home_source_downloads_to_home_path(self):
         source, destination = infer_copy_args(":~/.pi/agent/multicodex.json", None)
-        self.assertEqual(source, ":.pi/agent/multicodex.json")
+        home_remote = Path.home().as_posix().lstrip("/")
+        self.assertEqual(source, f":{home_remote}/.pi/agent/multicodex.json")
         self.assertEqual(destination, str(Path.home() / ".pi" / "agent" / "multicodex.json"))
 
     def test_iter_local_files_rejects_empty_directory(self):
@@ -107,7 +111,7 @@ class PathTests(unittest.TestCase):
             def __init__(self):
                 self.uploads = []
 
-            def download_file(self, repo, path, *, ref=None):
+            def get_contents(self, repo, path, *, ref=None):
                 raise NotFound("missing")
 
             def put_file(self, repo, path, content, *, message, branch=None):
@@ -125,6 +129,46 @@ class PathTests(unittest.TestCase):
 
             self.assertEqual((uploaded, unchanged), (2, 0))
             self.assertEqual([item[1] for item in client.uploads], ["logs/a.txt", "logs/sub/b.txt"])
+
+    def test_upload_file_skips_unchanged_file_by_git_blob_sha(self):
+        class FakeClient:
+            def get_contents(self, repo, path, *, ref=None):
+                return {"type": "file", "sha": git_blob_sha(b"same")}
+
+            def put_file(self, repo, path, content, *, message, branch=None):
+                raise AssertionError("unchanged file should not be uploaded")
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "same.txt"
+            path.write_bytes(b"same")
+
+            changed, short_sha = upload_file_if_changed(FakeClient(), "octo/repo", "main", path, "same.txt", None)
+
+            self.assertFalse(changed)
+            self.assertEqual(short_sha, "")
+
+    def test_download_file_falls_back_to_git_blob_api(self):
+        content = b"larger than contents inline payload"
+        sha = "abc123"
+        encoded = base64.b64encode(content).decode("ascii")
+        client = GitHubClient("token")
+        requested_routes = []
+
+        def fake_request(method, route, body=None):
+            requested_routes.append(route)
+            if route == "/repos/octo/repo/contents/big.log?ref=main":
+                return {"type": "file", "sha": sha, "encoding": "none"}
+            if route == f"/repos/octo/repo/git/blobs/{sha}":
+                return {"encoding": "base64", "content": encoded}
+            raise AssertionError(f"unexpected route: {route}")
+
+        client._request = fake_request
+
+        downloaded, metadata = client.download_file("octo/repo", "big.log", ref="main")
+
+        self.assertEqual(downloaded, content)
+        self.assertEqual(metadata["sha"], sha)
+        self.assertEqual(requested_routes, ["/repos/octo/repo/contents/big.log?ref=main", f"/repos/octo/repo/git/blobs/{sha}"])
 
 
 class ConfigTests(unittest.TestCase):

@@ -26,7 +26,7 @@ from .config import (
     set_account,
     users_for_host,
 )
-from .github import GitHubClient, GitHubError, NotFound, parse_repo
+from .github import GitHubClient, GitHubError, NotFound, git_blob_sha, parse_repo
 from .oauth import OAuthError, login_with_browser
 
 HELP = """GitHub-backed file sync.
@@ -128,7 +128,7 @@ def run_copy(argv: list[str]) -> int:
     client = GitHubClient(ctx.token, ctx.host)
 
     if src.kind == "local" and dst.kind == "github":
-        local_path = Path(src.path).expanduser()
+        local_path = Path(src.path).expanduser().resolve(strict=False)
         if not local_path.exists():
             raise UserError(f"local path does not exist: {local_path}")
         remote_repo = resolve_remote_repo(ctx.repo, dst.repo)
@@ -646,9 +646,12 @@ def upload_file_if_changed(
     message: Optional[str],
 ) -> tuple[bool, str]:
     local_content = local_path.read_bytes()
+    local_sha = git_blob_sha(local_content)
     try:
-        remote_content, _metadata = client.download_file(remote_repo, remote_path, ref=branch)
-        if remote_content == local_content:
+        remote_metadata = client.get_contents(remote_repo, remote_path, ref=branch)
+        if not isinstance(remote_metadata, dict) or remote_metadata.get("type") != "file":
+            raise GitHubError(f"{remote_path} already exists and is not a file")
+        if str(remote_metadata.get("sha") or "") == local_sha:
             return False, ""
     except NotFound:
         pass
@@ -695,24 +698,25 @@ def infer_copy_args(source: str, destination: Optional[str]) -> tuple[str, str]:
 
 
 def default_remote_path_for_remote_arg(path: str) -> str:
-    if path.startswith("~/"):
-        return path[2:]
+    expanded = Path(path).expanduser()
+    if path.startswith("~/") or expanded.is_absolute():
+        return expanded.as_posix().lstrip("/")
     return path
 
 
 def default_local_path_for_remote_arg(path: str) -> str:
     if path.startswith("~/"):
         return str(Path(path).expanduser())
+    home_remote_prefix = Path.home().as_posix().lstrip("/")
+    if path == home_remote_prefix or path.startswith(f"{home_remote_prefix}/"):
+        return f"/{path}"
     return path
 
 
 def default_remote_path_for_local(path: str) -> str:
     expanded = Path(path).expanduser()
     if expanded.is_absolute():
-        try:
-            return expanded.relative_to(Path.home()).as_posix()
-        except ValueError:
-            return expanded.as_posix().lstrip("/")
+        return expanded.as_posix().lstrip("/")
     return path.replace("\\", "/")
 
 
@@ -746,17 +750,17 @@ def resolve_remote_repo(default_repo: str, repo_part: str) -> str:
 def output_path_for_remote(destination: str, remote_path: str) -> Path:
     path = Path(destination).expanduser()
     if path.exists() and path.is_dir():
-        return path / Path(remote_path).name
-    return path
+        path = path / Path(remote_path).name
+    return path.resolve(strict=False)
 
 
 def output_path_for(file_name: str, output: Optional[str]) -> Path:
     if output:
         path = Path(output).expanduser()
         if path.exists() and path.is_dir():
-            return path / Path(file_name).name
-        return path
-    return Path(file_name).expanduser()
+            path = path / Path(file_name).name
+        return path.resolve(strict=False)
+    return Path(file_name).expanduser().resolve(strict=False)
 
 
 if __name__ == "__main__":  # pragma: no cover

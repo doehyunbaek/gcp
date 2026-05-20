@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import binascii
+import hashlib
 import json
 from typing import Any, Dict, Optional
 from urllib.error import HTTPError, URLError
@@ -38,6 +40,11 @@ def parse_repo(repo: str) -> tuple[str, str]:
     if len(parts) != 2 or not all(parts):
         raise ValueError("repository must be in owner/repo format")
     return parts[0], parts[1]
+
+
+def git_blob_sha(content: bytes) -> str:
+    header = f"blob {len(content)}\0".encode("utf-8")
+    return hashlib.sha1(header + content).hexdigest()
 
 
 class GitHubClient:
@@ -133,17 +140,27 @@ class GitHubClient:
             route += "?" + urlencode({"ref": ref})
         return self._request("GET", route)
 
+    def get_blob(self, repo: str, sha: str) -> Dict[str, Any]:
+        owner, name = parse_repo(repo)
+        return self._request("GET", f"/repos/{quote(owner)}/{quote(name)}/git/blobs/{quote(sha)}")
+
+    def download_blob(self, repo: str, sha: str, *, path_for_error: Optional[str] = None) -> bytes:
+        label = path_for_error or sha
+        data = self.get_blob(repo, sha)
+        if data.get("encoding") != "base64" or "content" not in data:
+            raise GitHubError(f"{label} is too large or cannot be decoded via the GitHub blob API")
+        return _decode_base64_content(str(data["content"]), label)
+
     def download_file(self, repo: str, path: str, *, ref: Optional[str] = None) -> tuple[bytes, Dict[str, Any]]:
         data = self.get_contents(repo, path, ref=ref)
-        if isinstance(data, list) or data.get("type") != "file":
+        if not isinstance(data, dict) or data.get("type") != "file":
             raise GitHubError(f"{path} is not a file in {repo}")
-        if data.get("encoding") != "base64" or "content" not in data:
-            raise GitHubError(f"{path} is too large or cannot be decoded via the GitHub contents API")
-        encoded = str(data["content"]).replace("\n", "")
-        try:
-            return base64.b64decode(encoded, validate=True), data
-        except ValueError as e:
-            raise GitHubError(f"could not decode {path}: {e}") from e
+        if data.get("encoding") == "base64" and "content" in data:
+            return _decode_base64_content(str(data["content"]), path), data
+        sha = str(data.get("sha") or "")
+        if sha:
+            return self.download_blob(repo, sha, path_for_error=path), data
+        raise GitHubError(f"{path} is too large or cannot be decoded via the GitHub contents API")
 
     def put_file(
         self,
@@ -180,6 +197,14 @@ class GitHubClient:
             body["sha"] = sha
 
         return self._request("PUT", route, body)
+
+
+def _decode_base64_content(content: str, label: str) -> bytes:
+    encoded = content.replace("\n", "").replace("\r", "")
+    try:
+        return base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as e:
+        raise GitHubError(f"could not decode {label}: {e}") from e
 
 
 def _extract_error_message(raw: str) -> str:
