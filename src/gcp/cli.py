@@ -4,6 +4,7 @@ import argparse
 import base64
 import getpass
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -94,6 +95,8 @@ class UploadCandidate:
     remote_path: str
     size: int
     sha: str
+    mtime_ns: int = 0
+    ctime_ns: int = 0
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -682,6 +685,8 @@ def _upload_directory_with_git_remote(
     total_size = sum(candidate.size for candidate in candidates)
     show_progress = sys.stderr.isatty() and (len(candidates) >= 50 or total_size >= 50 * 1024 * 1024)
     git_env = _git_env_with_identity(env or os.environ.copy())
+    cache_path = _git_upload_cache_path(remote_url, branch, local_dir, remote_dir)
+    cache = _load_git_hash_cache(cache_path)
 
     with tempfile.TemporaryDirectory(prefix="gcp-git-") as tmp:
         repo_dir = Path(tmp)
@@ -701,14 +706,23 @@ def _upload_directory_with_git_remote(
             raise GitHubError(f"could not determine head sha for branch {branch}")
         _run_git(["read-tree", head_sha], repo_dir, git_env)
 
-        _progress(show_progress, "hashing files into git object database")
-        candidates = _git_hash_uploads(repo_dir, git_env, candidates)
         remote_shas = _git_index_file_shas(repo_dir, git_env, remote_dir)
         _raise_for_git_path_conflicts(remote_shas, candidates)
+
+        cached, to_hash = _git_split_cached_hashes(candidates, remote_shas, cache)
+        if to_hash:
+            _progress(show_progress, f"hashing {len(to_hash)} changed/unknown file(s) into git object database")
+            hashed = _git_hash_uploads(repo_dir, git_env, to_hash)
+        else:
+            _progress(show_progress, f"reusing cached hashes for {len(cached)} file(s)")
+            hashed = []
+        candidates_by_path = {candidate.remote_path: candidate for candidate in [*cached, *hashed]}
+        candidates = [candidates_by_path[candidate.remote_path] for candidate in candidates]
 
         changed = [candidate for candidate in candidates if remote_shas.get(candidate.remote_path) != candidate.sha]
         unchanged = len(candidates) - len(changed)
         if not changed:
+            _save_git_hash_cache(cache_path, remote_url, branch, local_dir, remote_dir, candidates)
             _progress(show_progress, "no changed files to push")
             return 0, unchanged
 
@@ -727,6 +741,7 @@ def _upload_directory_with_git_remote(
 
         _progress(show_progress, "pushing one commit")
         _run_git(["push", "--progress", "origin", f"{commit_sha}:refs/heads/{branch}"], repo_dir, git_env, stream=show_progress)
+        _save_git_hash_cache(cache_path, remote_url, branch, local_dir, remote_dir, candidates)
         return len(changed), unchanged
 
 
@@ -807,8 +822,9 @@ def _prepare_directory_uploads(
         rel = path.relative_to(local_dir).as_posix()
         remote_path = build_remote_path(rel, f"{remote_dir}/{rel}", "")
         size = _validate_upload_size(path) if contents_api_limits else _validate_git_upload_size(path)
+        stat = path.stat()
         sha = _git_blob_sha_for_file(path, size) if hash_files else ""
-        candidates.append(UploadCandidate(path, remote_path, size, sha))
+        candidates.append(UploadCandidate(path, remote_path, size, sha, int(stat.st_mtime_ns), int(stat.st_ctime_ns)))
     return candidates
 
 
@@ -874,6 +890,109 @@ def _progress(enabled: bool, message: str) -> None:
         print(f"gcp: {message}...", file=sys.stderr)
 
 
+def _gcp_cache_dir() -> Path:
+    override = os.environ.get("GCP_CACHE_DIR")
+    if override:
+        return Path(override).expanduser()
+    xdg_cache = os.environ.get("XDG_CACHE_HOME")
+    base = Path(xdg_cache).expanduser() if xdg_cache else Path.home() / ".cache"
+    return base / "gcp"
+
+
+def _git_upload_cache_path(remote_url: str, branch: str, local_dir: Path, remote_dir: str) -> Path:
+    key_data = json.dumps(
+        {
+            "remote_url": remote_url,
+            "branch": branch,
+            "local_dir": str(local_dir.resolve(strict=False)),
+            "remote_dir": normalize_remote_dir(remote_dir),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return _gcp_cache_dir() / "upload-hashes" / f"{hashlib.sha256(key_data).hexdigest()}.json"
+
+
+def _load_git_hash_cache(path: Path) -> dict[str, Any]:
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {"files": {}}
+    if not isinstance(data, dict) or data.get("version") != 1 or not isinstance(data.get("files"), dict):
+        return {"files": {}}
+    return data
+
+
+def _save_git_hash_cache(
+    path: Path,
+    remote_url: str,
+    branch: str,
+    local_dir: Path,
+    remote_dir: str,
+    candidates: list[UploadCandidate],
+) -> None:
+    files = {}
+    for candidate in candidates:
+        if not candidate.sha:
+            continue
+        files[candidate.remote_path] = {
+            "size": candidate.size,
+            "mtime_ns": candidate.mtime_ns,
+            "ctime_ns": candidate.ctime_ns,
+            "sha": candidate.sha,
+        }
+    data = {
+        "version": 1,
+        "remote_url": remote_url,
+        "branch": branch,
+        "local_dir": str(local_dir.resolve(strict=False)),
+        "remote_dir": normalize_remote_dir(remote_dir),
+        "files": files,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        with tmp_path.open("w", encoding="utf-8") as f:
+            json.dump(data, f, separators=(",", ":"))
+            f.write("\n")
+        tmp_path.replace(path)
+    except OSError:
+        # Cache failures should not make a sync fail.
+        pass
+
+
+def _cache_int(value: Any, default: int = -1) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _git_split_cached_hashes(
+    candidates: list[UploadCandidate],
+    remote_shas: dict[str, str],
+    cache: dict[str, Any],
+) -> tuple[list[UploadCandidate], list[UploadCandidate]]:
+    files = cache.get("files", {}) if isinstance(cache, dict) else {}
+    cached = []
+    to_hash = []
+    for candidate in candidates:
+        entry = files.get(candidate.remote_path) if isinstance(files, dict) else None
+        sha = str(entry.get("sha") or "") if isinstance(entry, dict) else ""
+        if (
+            sha
+            and _cache_int(entry.get("size")) == candidate.size
+            and _cache_int(entry.get("mtime_ns")) == candidate.mtime_ns
+            and _cache_int(entry.get("ctime_ns")) == candidate.ctime_ns
+            and remote_shas.get(candidate.remote_path) == sha
+        ):
+            cached.append(UploadCandidate(candidate.local_path, candidate.remote_path, candidate.size, sha, candidate.mtime_ns, candidate.ctime_ns))
+        else:
+            to_hash.append(candidate)
+    return cached, to_hash
+
+
 def _git_hash_uploads(repo_dir: Path, env: dict[str, str], candidates: list[UploadCandidate]) -> list[UploadCandidate]:
     if not candidates:
         return []
@@ -884,14 +1003,17 @@ def _git_hash_uploads(repo_dir: Path, env: dict[str, str], candidates: list[Uplo
         shas = [line.strip() for line in output.splitlines() if line.strip()]
         if len(shas) != len(candidates):
             raise GitHubError(f"git returned {len(shas)} blob sha(s) for {len(candidates)} file(s)")
-        return [UploadCandidate(candidate.local_path, candidate.remote_path, candidate.size, sha) for candidate, sha in zip(candidates, shas)]
+        return [
+            UploadCandidate(candidate.local_path, candidate.remote_path, candidate.size, sha, candidate.mtime_ns, candidate.ctime_ns)
+            for candidate, sha in zip(candidates, shas)
+        ]
 
     hashed = []
     for candidate in candidates:
         sha = _run_git(["hash-object", "-w", "--no-filters", "--", str(candidate.local_path)], repo_dir, env).strip()
         if not sha:
             raise GitHubError(f"git did not return a blob sha for {candidate.local_path}")
-        hashed.append(UploadCandidate(candidate.local_path, candidate.remote_path, candidate.size, sha))
+        hashed.append(UploadCandidate(candidate.local_path, candidate.remote_path, candidate.size, sha, candidate.mtime_ns, candidate.ctime_ns))
     return hashed
 
 

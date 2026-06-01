@@ -36,7 +36,7 @@ The `uvx gcp setting` flow is modeled after `gh auth login/logout`:
 
 Token scope needed for private repositories and writes: `repo`.
 
-Directory uploads use the local `git` executable to create and push one packed commit.
+Directory uploads use the local `git` executable to create and push one packed commit. Local blob hashes are cached under `~/.cache/gcp` (or `GCP_CACHE_DIR`) so repeated no-change syncs avoid rereading every file.
 
 ## Examples
 

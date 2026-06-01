@@ -195,18 +195,20 @@ class PathTests(unittest.TestCase):
             env = os.environ.copy()
             env.update({"GIT_AUTHOR_NAME": "gcp", "GIT_AUTHOR_EMAIL": "gcp@example.com", "GIT_COMMITTER_NAME": "gcp", "GIT_COMMITTER_EMAIL": "gcp@example.com"})
 
-            uploaded, unchanged = _upload_directory_with_git_remote(str(bare), "main", local, "logs", None, env=env)
+            with patch.dict(os.environ, {"GCP_CACHE_DIR": str(root / "cache")}):
+                uploaded, unchanged = _upload_directory_with_git_remote(str(bare), "main", local, "logs", None, env=env)
 
-            self.assertEqual((uploaded, unchanged), (2, 0))
-            run_git_command(["git", "clone", "--quiet", "--branch", "main", str(bare), str(clone)])
-            self.assertEqual((clone / "README.md").read_text(), "root\n")
-            self.assertEqual((clone / "logs" / "a.txt").read_text(), "a")
-            self.assertEqual((clone / "logs" / "sub" / "b.txt").read_text(), "b")
-            commits = run_git_command(["git", "log", "--oneline"], cwd=clone).splitlines()
-            self.assertEqual(len(commits), 2)
+                self.assertEqual((uploaded, unchanged), (2, 0))
+                run_git_command(["git", "clone", "--quiet", "--branch", "main", str(bare), str(clone)])
+                self.assertEqual((clone / "README.md").read_text(), "root\n")
+                self.assertEqual((clone / "logs" / "a.txt").read_text(), "a")
+                self.assertEqual((clone / "logs" / "sub" / "b.txt").read_text(), "b")
+                commits = run_git_command(["git", "log", "--oneline"], cwd=clone).splitlines()
+                self.assertEqual(len(commits), 2)
 
-            uploaded, unchanged = _upload_directory_with_git_remote(str(bare), "main", local, "logs", None, env=env)
-            self.assertEqual((uploaded, unchanged), (0, 2))
+                with patch("gcp.cli._git_hash_uploads", side_effect=AssertionError("cached sync should not hash file contents")):
+                    uploaded, unchanged = _upload_directory_with_git_remote(str(bare), "main", local, "logs", None, env=env)
+                self.assertEqual((uploaded, unchanged), (0, 2))
 
     def test_upload_file_skips_unchanged_file_by_git_blob_sha(self):
         class FakeClient:
