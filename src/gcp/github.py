@@ -4,6 +4,7 @@ import base64
 import binascii
 import hashlib
 import json
+from http.client import IncompleteRead
 from typing import Any, Dict, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
@@ -48,13 +49,14 @@ def git_blob_sha(content: bytes) -> str:
 
 
 class GitHubClient:
-    def __init__(self, token: str, hostname: str = DEFAULT_HOST, timeout: int = 30):
+    def __init__(self, token: str, hostname: str = DEFAULT_HOST, timeout: int = 30, retries: int = 2):
         if not token:
             raise ValueError("GitHub token is required")
         self.token = token
         self.hostname = normalize_host(hostname)
         self.base_url = api_base(self.hostname)
         self.timeout = timeout
+        self.retries = max(0, retries)
 
     def _request(self, method: str, route: str, body: Optional[Dict[str, Any]] = None) -> Any:
         url = self.base_url + route
@@ -69,20 +71,31 @@ class GitHubClient:
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"
 
-        request = Request(url, data=data, headers=headers, method=method)
-        try:
-            with urlopen(request, timeout=self.timeout) as response:
-                raw = response.read().decode("utf-8")
-        except HTTPError as e:
-            raw = e.read().decode("utf-8", errors="replace")
-            message = _extract_error_message(raw) or e.reason or f"HTTP {e.code}"
-            if e.code == 401:
-                raise Unauthorized(message, status=e.code) from e
-            if e.code == 404:
-                raise NotFound(message, status=e.code) from e
-            raise GitHubError(message, status=e.code) from e
-        except URLError as e:
-            raise GitHubError(f"could not reach GitHub: {e.reason}") from e
+        attempts = self.retries + 1 if method.upper() in {"GET", "HEAD"} else 1
+        last_incomplete: Optional[IncompleteRead] = None
+        for attempt in range(attempts):
+            request = Request(url, data=data, headers=headers, method=method)
+            try:
+                with urlopen(request, timeout=self.timeout) as response:
+                    raw = response.read().decode("utf-8")
+                break
+            except IncompleteRead as e:
+                last_incomplete = e
+                if attempt + 1 < attempts:
+                    continue
+                raise GitHubError(f"incomplete response from GitHub after {attempts} attempts: {e}") from e
+            except HTTPError as e:
+                raw = e.read().decode("utf-8", errors="replace")
+                message = _extract_error_message(raw) or e.reason or f"HTTP {e.code}"
+                if e.code == 401:
+                    raise Unauthorized(message, status=e.code) from e
+                if e.code == 404:
+                    raise NotFound(message, status=e.code) from e
+                raise GitHubError(message, status=e.code) from e
+            except URLError as e:
+                raise GitHubError(f"could not reach GitHub: {e.reason}") from e
+        else:
+            raise GitHubError(f"incomplete response from GitHub: {last_incomplete}")
 
         if not raw:
             return {}
@@ -112,6 +125,48 @@ class GitHubClient:
             "POST",
             f"/repos/{quote(owner)}/{quote(name)}/git/refs",
             {"ref": ref, "sha": sha},
+        )
+
+    def get_commit(self, repo: str, sha: str) -> Dict[str, Any]:
+        owner, name = parse_repo(repo)
+        return self._request("GET", f"/repos/{quote(owner)}/{quote(name)}/git/commits/{quote(sha)}")
+
+    def get_tree(self, repo: str, sha: str, *, recursive: bool = False) -> Dict[str, Any]:
+        owner, name = parse_repo(repo)
+        route = f"/repos/{quote(owner)}/{quote(name)}/git/trees/{quote(sha)}"
+        if recursive:
+            route += "?" + urlencode({"recursive": "1"})
+        return self._request("GET", route)
+
+    def create_blob(self, repo: str, content: bytes) -> Dict[str, Any]:
+        owner, name = parse_repo(repo)
+        return self._request(
+            "POST",
+            f"/repos/{quote(owner)}/{quote(name)}/git/blobs",
+            {"content": base64.b64encode(content).decode("ascii"), "encoding": "base64"},
+        )
+
+    def create_tree(self, repo: str, tree: list[Dict[str, Any]], *, base_tree: Optional[str] = None) -> Dict[str, Any]:
+        owner, name = parse_repo(repo)
+        body: Dict[str, Any] = {"tree": tree}
+        if base_tree:
+            body["base_tree"] = base_tree
+        return self._request("POST", f"/repos/{quote(owner)}/{quote(name)}/git/trees", body)
+
+    def create_commit(self, repo: str, message: str, tree: str, parents: list[str]) -> Dict[str, Any]:
+        owner, name = parse_repo(repo)
+        return self._request(
+            "POST",
+            f"/repos/{quote(owner)}/{quote(name)}/git/commits",
+            {"message": message, "tree": tree, "parents": parents},
+        )
+
+    def update_ref(self, repo: str, ref: str, sha: str, *, force: bool = False) -> Dict[str, Any]:
+        owner, name = parse_repo(repo)
+        return self._request(
+            "PATCH",
+            f"/repos/{quote(owner)}/{quote(name)}/git/refs/{quote(ref, safe='/')}",
+            {"sha": sha, "force": force},
         )
 
     def ensure_branch(self, repo: str, branch: str) -> None:

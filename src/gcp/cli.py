@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import getpass
+import hashlib
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Sequence
@@ -26,8 +31,11 @@ from .config import (
     set_account,
     users_for_host,
 )
-from .github import GitHubClient, GitHubError, NotFound, git_blob_sha, parse_repo
+from .github import GitHubClient, GitHubError, NotFound, parse_repo
 from .oauth import OAuthError, login_with_browser
+
+GITHUB_CONTENTS_MAX_FILE_SIZE = 100 * 1024 * 1024
+GITHUB_CONTENTS_MAX_REQUEST_SIZE = 50 * 1000 * 1000
 
 HELP = """GitHub-backed file sync.
 
@@ -78,6 +86,14 @@ class CopyTarget:
     kind: str
     path: str
     repo: str = ""
+
+
+@dataclass(frozen=True)
+class UploadCandidate:
+    local_path: Path
+    remote_path: str
+    size: int
+    sha: str
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -624,17 +640,354 @@ def upload_directory(
     remote_dir: str,
     message: Optional[str],
 ) -> tuple[int, int]:
-    uploaded = 0
+    if isinstance(client, GitHubClient):
+        if shutil.which("git") is None:
+            raise UserError("directory uploads require git to push files efficiently; install git and try again")
+        client.ensure_branch(remote_repo, branch)
+        return _upload_directory_with_git(
+            _git_remote_url(client.hostname, remote_repo),
+            client.token,
+            branch,
+            local_dir,
+            remote_dir,
+            message,
+        )
+
+    # Test/fake-client fallback, and a non-git implementation kept for custom clients.
+    return _upload_directory_with_api(client, remote_repo, branch, local_dir, remote_dir, message)
+
+
+def _upload_directory_with_git(
+    remote_url: str,
+    token: str,
+    branch: str,
+    local_dir: Path,
+    remote_dir: str,
+    message: Optional[str],
+) -> tuple[int, int]:
+    env = _git_env(token)
+    return _upload_directory_with_git_remote(remote_url, branch, local_dir, remote_dir, message, env=env)
+
+
+def _upload_directory_with_git_remote(
+    remote_url: str,
+    branch: str,
+    local_dir: Path,
+    remote_dir: str,
+    message: Optional[str],
+    *,
+    env: Optional[dict[str, str]] = None,
+) -> tuple[int, int]:
+    candidates = _prepare_directory_uploads(local_dir, remote_dir, hash_files=False, contents_api_limits=False)
+    total_size = sum(candidate.size for candidate in candidates)
+    show_progress = sys.stderr.isatty() and (len(candidates) >= 50 or total_size >= 50 * 1024 * 1024)
+    git_env = _git_env_with_identity(env or os.environ.copy())
+
+    with tempfile.TemporaryDirectory(prefix="gcp-git-") as tmp:
+        repo_dir = Path(tmp)
+        _progress(show_progress, f"preparing git push for {len(candidates)} file(s), {_format_size(total_size)}")
+        _run_git(["init", "--quiet"], repo_dir, git_env)
+        _run_git(["remote", "add", "origin", remote_url], repo_dir, git_env)
+
+        _progress(show_progress, f"fetching {branch} tree")
+        _run_git(
+            ["fetch", "--depth=1", "--filter=blob:none", "--no-tags", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}"],
+            repo_dir,
+            git_env,
+            stream=show_progress,
+        )
+        head_sha = _run_git(["rev-parse", f"refs/remotes/origin/{branch}"], repo_dir, git_env).strip()
+        if not head_sha:
+            raise GitHubError(f"could not determine head sha for branch {branch}")
+        _run_git(["read-tree", head_sha], repo_dir, git_env)
+
+        _progress(show_progress, "hashing files into git object database")
+        candidates = _git_hash_uploads(repo_dir, git_env, candidates)
+        remote_shas = _git_index_file_shas(repo_dir, git_env, remote_dir)
+        _raise_for_git_path_conflicts(remote_shas, candidates)
+
+        changed = [candidate for candidate in candidates if remote_shas.get(candidate.remote_path) != candidate.sha]
+        unchanged = len(candidates) - len(changed)
+        if not changed:
+            _progress(show_progress, "no changed files to push")
+            return 0, unchanged
+
+        _progress(show_progress, f"packing {len(changed)} changed file(s) into one commit")
+        _git_update_index(repo_dir, git_env, changed)
+        tree_sha = _run_git(["write-tree"], repo_dir, git_env).strip()
+        if not tree_sha:
+            raise GitHubError("git did not return a tree sha")
+        commit_sha = _run_git(
+            ["commit-tree", tree_sha, "-p", head_sha, "-m", message or f"gcp: sync {remote_dir or local_dir.name}"],
+            repo_dir,
+            git_env,
+        ).strip()
+        if not commit_sha:
+            raise GitHubError("git did not return a commit sha")
+
+        _progress(show_progress, "pushing one commit")
+        _run_git(["push", "--progress", "origin", f"{commit_sha}:refs/heads/{branch}"], repo_dir, git_env, stream=show_progress)
+        return len(changed), unchanged
+
+
+def _upload_directory_with_api(
+    client: GitHubClient,
+    remote_repo: str,
+    branch: str,
+    local_dir: Path,
+    remote_dir: str,
+    message: Optional[str],
+) -> tuple[int, int]:
+    candidates = _prepare_directory_uploads(local_dir, remote_dir, hash_files=True, contents_api_limits=True)
+    client.ensure_branch(remote_repo, branch)
+
+    ref = client.get_ref(remote_repo, f"heads/{branch}")
+    head_sha = str(ref.get("object", {}).get("sha") or "")
+    if not head_sha:
+        raise GitHubError(f"could not determine head sha for {remote_repo}:{branch}")
+
+    head_commit = client.get_commit(remote_repo, head_sha)
+    base_tree_sha = str(head_commit.get("tree", {}).get("sha") or "")
+    if not base_tree_sha:
+        raise GitHubError(f"could not determine tree sha for {remote_repo}:{branch}")
+
+    remote_shas = _remote_file_shas(client, remote_repo, base_tree_sha, remote_dir)
+    tree_entries: list[dict[str, Any]] = []
     unchanged = 0
+
+    for candidate in candidates:
+        if remote_shas.get(candidate.remote_path) == candidate.sha:
+            unchanged += 1
+            continue
+        try:
+            blob = client.create_blob(remote_repo, candidate.local_path.read_bytes())
+        except GitHubError as e:
+            raise GitHubError(
+                f"failed to upload {candidate.local_path} ({_format_size(candidate.size)}) to {candidate.remote_path}: {e}",
+                status=e.status,
+            ) from e
+        blob_sha = str(blob.get("sha") or "")
+        if not blob_sha:
+            raise GitHubError(f"GitHub did not return a blob sha for {candidate.remote_path}")
+        tree_entries.append({"path": candidate.remote_path, "mode": "100644", "type": "blob", "sha": blob_sha})
+
+    if not tree_entries:
+        return 0, unchanged
+
+    try:
+        tree = client.create_tree(remote_repo, tree_entries, base_tree=base_tree_sha)
+        tree_sha = str(tree.get("sha") or "")
+        if not tree_sha:
+            raise GitHubError("GitHub did not return a tree sha")
+        commit = client.create_commit(
+            remote_repo,
+            message or f"gcp: sync {remote_dir or local_dir.name}",
+            tree_sha,
+            [head_sha],
+        )
+        commit_sha = str(commit.get("sha") or "")
+        if not commit_sha:
+            raise GitHubError("GitHub did not return a commit sha")
+        client.update_ref(remote_repo, f"heads/{branch}", commit_sha)
+    except GitHubError as e:
+        raise GitHubError(f"failed to commit directory upload to {remote_repo}:{remote_dir}: {e}", status=e.status) from e
+
+    return len(tree_entries), unchanged
+
+
+def _prepare_directory_uploads(
+    local_dir: Path,
+    remote_dir: str,
+    *,
+    hash_files: bool,
+    contents_api_limits: bool,
+) -> list[UploadCandidate]:
+    candidates = []
     for path in iter_local_files(local_dir):
         rel = path.relative_to(local_dir).as_posix()
         remote_path = build_remote_path(rel, f"{remote_dir}/{rel}", "")
-        changed, _short_sha = upload_file_if_changed(client, remote_repo, branch, path, remote_path, message)
-        if changed:
-            uploaded += 1
-        else:
-            unchanged += 1
-    return uploaded, unchanged
+        size = _validate_upload_size(path) if contents_api_limits else _validate_git_upload_size(path)
+        sha = _git_blob_sha_for_file(path, size) if hash_files else ""
+        candidates.append(UploadCandidate(path, remote_path, size, sha))
+    return candidates
+
+
+def _git_remote_url(hostname: str, repo: str) -> str:
+    owner, name = parse_repo(repo)
+    return f"https://{normalize_host(hostname)}/{owner}/{name}.git"
+
+
+def _git_env(token: str) -> dict[str, str]:
+    env = os.environ.copy()
+    encoded = base64.b64encode(f"x-access-token:{token}".encode("utf-8")).decode("ascii")
+    env.update(
+        {
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "http.extraheader",
+            "GIT_CONFIG_VALUE_0": f"Authorization: Basic {encoded}",
+        }
+    )
+    return env
+
+
+def _git_env_with_identity(env: dict[str, str]) -> dict[str, str]:
+    env = env.copy()
+    env.setdefault("GIT_AUTHOR_NAME", "gcp")
+    env.setdefault("GIT_AUTHOR_EMAIL", "gcp@localhost")
+    env.setdefault("GIT_COMMITTER_NAME", env["GIT_AUTHOR_NAME"])
+    env.setdefault("GIT_COMMITTER_EMAIL", env["GIT_AUTHOR_EMAIL"])
+    env.setdefault("GIT_TERMINAL_PROMPT", "0")
+    return env
+
+
+def _run_git(
+    args: list[str],
+    cwd: Path,
+    env: dict[str, str],
+    *,
+    input_data: Optional[str] = None,
+    stream: bool = False,
+) -> str:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=str(cwd),
+            env=env,
+            input=input_data,
+            text=True,
+            stdout=None if stream else subprocess.PIPE,
+            stderr=None if stream else subprocess.PIPE,
+            check=False,
+        )
+    except OSError as e:
+        raise GitHubError(f"could not run git: {e}") from e
+    if result.returncode != 0:
+        detail = "" if stream else (result.stderr or result.stdout or "").strip()
+        command = "git " + " ".join(args)
+        raise GitHubError(f"{command} failed" + (f": {detail}" if detail else ""))
+    return result.stdout or ""
+
+
+def _progress(enabled: bool, message: str) -> None:
+    if enabled:
+        print(f"gcp: {message}...", file=sys.stderr)
+
+
+def _git_hash_uploads(repo_dir: Path, env: dict[str, str], candidates: list[UploadCandidate]) -> list[UploadCandidate]:
+    if not candidates:
+        return []
+
+    if all("\n" not in str(candidate.local_path) and "\r" not in str(candidate.local_path) for candidate in candidates):
+        input_data = "".join(f"{candidate.local_path}\n" for candidate in candidates)
+        output = _run_git(["hash-object", "-w", "--no-filters", "--stdin-paths"], repo_dir, env, input_data=input_data)
+        shas = [line.strip() for line in output.splitlines() if line.strip()]
+        if len(shas) != len(candidates):
+            raise GitHubError(f"git returned {len(shas)} blob sha(s) for {len(candidates)} file(s)")
+        return [UploadCandidate(candidate.local_path, candidate.remote_path, candidate.size, sha) for candidate, sha in zip(candidates, shas)]
+
+    hashed = []
+    for candidate in candidates:
+        sha = _run_git(["hash-object", "-w", "--no-filters", "--", str(candidate.local_path)], repo_dir, env).strip()
+        if not sha:
+            raise GitHubError(f"git did not return a blob sha for {candidate.local_path}")
+        hashed.append(UploadCandidate(candidate.local_path, candidate.remote_path, candidate.size, sha))
+    return hashed
+
+
+def _git_index_file_shas(repo_dir: Path, env: dict[str, str], remote_dir: str) -> dict[str, str]:
+    prefix = normalize_remote_dir(remote_dir)
+    args = ["ls-files", "-s", "-z"]
+    if prefix:
+        args.extend(["--", f":(literal){prefix}"])
+    output = _run_git(args, repo_dir, env)
+    shas: dict[str, str] = {}
+    for record in output.split("\0"):
+        if not record:
+            continue
+        metadata, path = record.split("\t", 1)
+        if prefix and path == prefix:
+            raise GitHubError(f"{prefix} already exists and is not a directory")
+        if prefix and not path.startswith(f"{prefix}/"):
+            continue
+        parts = metadata.split()
+        if len(parts) >= 2:
+            shas[path] = parts[1]
+    return shas
+
+
+def _raise_for_git_path_conflicts(remote_shas: dict[str, str], candidates: list[UploadCandidate]) -> None:
+    remote_files = set(remote_shas)
+    remote_dirs = set()
+    for path in remote_files:
+        parts = path.split("/")
+        for index in range(1, len(parts)):
+            remote_dirs.add("/".join(parts[:index]))
+
+    for candidate in candidates:
+        parts = candidate.remote_path.split("/")
+        for index in range(1, len(parts)):
+            parent = "/".join(parts[:index])
+            if parent in remote_files:
+                raise GitHubError(f"{parent} already exists and is not a directory")
+        if candidate.remote_path in remote_dirs:
+            raise GitHubError(f"{candidate.remote_path} already exists and is a directory")
+
+
+def _git_update_index(repo_dir: Path, env: dict[str, str], candidates: list[UploadCandidate]) -> None:
+    if not candidates:
+        return
+    input_data = "".join(f"100644 {candidate.sha}\t{candidate.remote_path}\0" for candidate in candidates)
+    _run_git(["update-index", "-z", "--index-info"], repo_dir, env, input_data=input_data)
+
+
+def _remote_file_shas(client: GitHubClient, remote_repo: str, base_tree_sha: str, remote_dir: str) -> dict[str, str]:
+    prefix = normalize_remote_dir(remote_dir)
+    tree_sha = base_tree_sha
+    if prefix:
+        entry = _find_tree_entry(client, remote_repo, base_tree_sha, prefix)
+        if entry is None:
+            return {}
+        if entry.get("type") != "tree":
+            raise GitHubError(f"{prefix} already exists and is not a directory")
+        tree_sha = str(entry.get("sha") or "")
+        if not tree_sha:
+            raise GitHubError(f"could not determine tree sha for {prefix}")
+
+    tree = client.get_tree(remote_repo, tree_sha, recursive=True)
+    if tree.get("truncated"):
+        raise GitHubError(f"remote tree for {remote_repo}:{prefix or '/'} is too large to compare safely")
+
+    shas = {}
+    for entry in tree.get("tree", []):
+        if not isinstance(entry, dict) or entry.get("type") != "blob":
+            continue
+        path = str(entry.get("path") or "").strip("/")
+        sha = str(entry.get("sha") or "")
+        if not path or not sha:
+            continue
+        full_path = f"{prefix}/{path}" if prefix else path
+        shas[full_path] = sha
+    return shas
+
+
+def _find_tree_entry(client: GitHubClient, remote_repo: str, tree_sha: str, path: str) -> Optional[dict[str, Any]]:
+    current_tree_sha = tree_sha
+    parts = [part for part in normalize_remote_dir(path).split("/") if part]
+    for index, part in enumerate(parts):
+        tree = client.get_tree(remote_repo, current_tree_sha)
+        entries = tree.get("tree", [])
+        entry = next((item for item in entries if isinstance(item, dict) and item.get("path") == part), None)
+        if entry is None:
+            return None
+        if index == len(parts) - 1:
+            return entry
+        if entry.get("type") != "tree":
+            raise GitHubError(f"{'/'.join(parts[: index + 1])} already exists and is not a directory")
+        current_tree_sha = str(entry.get("sha") or "")
+        if not current_tree_sha:
+            raise GitHubError(f"could not determine tree sha for {'/'.join(parts[: index + 1])}")
+    return None
 
 
 def upload_file_if_changed(
@@ -645,8 +998,8 @@ def upload_file_if_changed(
     remote_path: str,
     message: Optional[str],
 ) -> tuple[bool, str]:
-    local_content = local_path.read_bytes()
-    local_sha = git_blob_sha(local_content)
+    local_size = _validate_upload_size(local_path)
+    local_sha = _git_blob_sha_for_file(local_path, local_size)
     try:
         remote_metadata = client.get_contents(remote_repo, remote_path, ref=branch)
         if not isinstance(remote_metadata, dict) or remote_metadata.get("type") != "file":
@@ -656,15 +1009,69 @@ def upload_file_if_changed(
     except NotFound:
         pass
 
-    result = client.put_file(
-        remote_repo,
-        remote_path,
-        local_content,
-        message=message or f"gcp: sync {remote_path}",
-        branch=branch,
-    )
+    local_content = local_path.read_bytes()
+    try:
+        result = client.put_file(
+            remote_repo,
+            remote_path,
+            local_content,
+            message=message or f"gcp: sync {remote_path}",
+            branch=branch,
+        )
+    except GitHubError as e:
+        raise GitHubError(f"failed to upload {local_path} ({_format_size(local_size)}) to {remote_path}: {e}", status=e.status) from e
     commit = result.get("commit", {}) if isinstance(result, dict) else {}
     return True, str(commit.get("sha", ""))[:7]
+
+
+def _validate_upload_size(path: Path) -> int:
+    local_size = path.stat().st_size
+    encoded_size = _base64_encoded_size(local_size)
+    if local_size > GITHUB_CONTENTS_MAX_FILE_SIZE:
+        raise UserError(
+            f"file is too large for GitHub contents API upload: {path} "
+            f"({_format_size(local_size)}); GitHub contents API file limit is {_format_size(GITHUB_CONTENTS_MAX_FILE_SIZE)}"
+        )
+    if encoded_size > GITHUB_CONTENTS_MAX_REQUEST_SIZE:
+        raise UserError(
+            f"file is too large for GitHub contents API upload: {path} "
+            f"({_format_size(local_size)}, {_format_size(encoded_size)} after base64 encoding); "
+            f"request limit is about {_format_size(GITHUB_CONTENTS_MAX_REQUEST_SIZE)}"
+        )
+    return local_size
+
+
+def _validate_git_upload_size(path: Path) -> int:
+    local_size = path.stat().st_size
+    if local_size > GITHUB_CONTENTS_MAX_FILE_SIZE:
+        raise UserError(
+            f"file is too large for GitHub upload: {path} "
+            f"({_format_size(local_size)}); GitHub file limit is {_format_size(GITHUB_CONTENTS_MAX_FILE_SIZE)}"
+        )
+    return local_size
+
+
+def _git_blob_sha_for_file(path: Path, size: int) -> str:
+    sha = hashlib.sha1(f"blob {size}\0".encode("utf-8"))
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            sha.update(chunk)
+    return sha.hexdigest()
+
+
+def _base64_encoded_size(size: int) -> int:
+    return ((size + 2) // 3) * 4
+
+
+def _format_size(size: int) -> str:
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    value = float(size)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{size} B"
+            return f"{value:.1f} {unit}"
+        value /= 1024
 
 
 def build_remote_path(file_name: str, remote_path: Optional[str], remote_dir: str = "") -> str:

@@ -21,7 +21,7 @@ GitHub paths use scp-like prefixes:
 - `owner/repo:path` uses an explicit repo, e.g. `doehyunbaekk/privatee:path`
 - `github:path` and `gh:path` are aliases for `:path`
 
-In one-argument upload mode, absolute local paths keep their full path inside the repository without the leading slash; for example `~/.pi/agent/multicodex.json` syncs to `home/you/.pi/agent/multicodex.json`. Passing a directory uploads every file under that directory while preserving relative paths. In one-argument download mode, `:path` copies from the configured repo/branch to an absolute local output path; `:~/.pi/agent/multicodex.json` reads `home/you/.pi/agent/multicodex.json` from GitHub and writes to `~/.pi/agent/multicodex.json`.
+In one-argument upload mode, absolute local paths keep their full path inside the repository without the leading slash; for example `~/.pi/agent/multicodex.json` syncs to `home/you/.pi/agent/multicodex.json`. Passing a directory uploads every file under that directory while preserving relative paths; changed files are packed with `git` and pushed as one commit. In one-argument download mode, `:path` copies from the configured repo/branch to an absolute local output path; `:~/.pi/agent/multicodex.json` reads `home/you/.pi/agent/multicodex.json` from GitHub and writes to `~/.pi/agent/multicodex.json`.
 
 ## Setup flow
 
@@ -35,6 +35,8 @@ The `uvx gcp setting` flow is modeled after `gh auth login/logout`:
 - logout removes only local config; it does not revoke GitHub tokens
 
 Token scope needed for private repositories and writes: `repo`.
+
+Directory uploads use the local `git` executable to create and push one packed commit.
 
 ## Examples
 

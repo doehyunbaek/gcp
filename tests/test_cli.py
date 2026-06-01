@@ -1,15 +1,18 @@
 import base64
 import os
+import shutil
+import subprocess
 import tempfile
 import unittest
+from http.client import IncompleteRead
 from contextlib import contextmanager, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
-from gcp.cli import UserError, build_remote_path, default_remote_path_for_local, infer_copy_args, iter_local_files, output_path_for, parse_copy_target, resolve_remote_repo, run, upload_directory, upload_file_if_changed
+from gcp.cli import UserError, _upload_directory_with_git_remote, build_remote_path, default_remote_path_for_local, infer_copy_args, iter_local_files, output_path_for, parse_copy_target, resolve_remote_repo, run, upload_directory, upload_file_if_changed
 from gcp.config import load_config, save_config, set_account
-from gcp.github import GitHubClient, NotFound, git_blob_sha
+from gcp.github import GitHubClient, GitHubError, NotFound, git_blob_sha
 
 
 @contextmanager
@@ -30,6 +33,13 @@ def isolated_config_dir():
                 os.environ.pop("GCP_CONFIG", None)
             else:
                 os.environ["GCP_CONFIG"] = old_config
+
+
+def run_git_command(args, *, cwd=None, env=None):
+    result = subprocess.run(args, cwd=cwd, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if result.returncode != 0:
+        raise AssertionError(f"command failed: {' '.join(args)}\nstdout={result.stdout}\nstderr={result.stderr}")
+    return result.stdout
 
 
 class PathTests(unittest.TestCase):
@@ -109,14 +119,39 @@ class PathTests(unittest.TestCase):
     def test_upload_directory_preserves_relative_paths(self):
         class FakeClient:
             def __init__(self):
-                self.uploads = []
+                self.blobs = []
+                self.trees = []
+                self.commits = []
+                self.ref_updates = []
 
-            def get_contents(self, repo, path, *, ref=None):
-                raise NotFound("missing")
+            def ensure_branch(self, repo, branch):
+                self.branch = (repo, branch)
 
-            def put_file(self, repo, path, content, *, message, branch=None):
-                self.uploads.append((repo, path, content, message, branch))
-                return {"commit": {"sha": "abcdef123"}}
+            def get_ref(self, repo, ref):
+                return {"object": {"sha": "head123"}}
+
+            def get_commit(self, repo, sha):
+                return {"tree": {"sha": "base123"}}
+
+            def get_tree(self, repo, sha, *, recursive=False):
+                return {"tree": []}
+
+            def create_blob(self, repo, content):
+                sha = f"blob{len(self.blobs) + 1}"
+                self.blobs.append((repo, content))
+                return {"sha": sha}
+
+            def create_tree(self, repo, tree, *, base_tree=None):
+                self.trees.append((repo, tree, base_tree))
+                return {"sha": "tree123"}
+
+            def create_commit(self, repo, message, tree, parents):
+                self.commits.append((repo, message, tree, parents))
+                return {"sha": "commit123"}
+
+            def update_ref(self, repo, ref, sha, *, force=False):
+                self.ref_updates.append((repo, ref, sha, force))
+                return {}
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -128,7 +163,50 @@ class PathTests(unittest.TestCase):
             uploaded, unchanged = upload_directory(client, "octo/repo", "main", root, "logs", None)
 
             self.assertEqual((uploaded, unchanged), (2, 0))
-            self.assertEqual([item[1] for item in client.uploads], ["logs/a.txt", "logs/sub/b.txt"])
+            self.assertEqual([item[1] for item in client.blobs], [b"a", b"b"])
+            self.assertEqual([entry["path"] for entry in client.trees[0][1]], ["logs/a.txt", "logs/sub/b.txt"])
+            self.assertEqual(client.trees[0][2], "base123")
+            self.assertEqual(client.commits, [("octo/repo", "gcp: sync logs", "tree123", ["head123"])])
+            self.assertEqual(client.ref_updates, [("octo/repo", "heads/main", "commit123", False)])
+
+    @unittest.skipIf(shutil.which("git") is None, "git is required")
+    def test_git_directory_upload_pushes_one_commit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bare = root / "remote.git"
+            seed = root / "seed"
+            local = root / "local"
+            clone = root / "clone"
+
+            run_git_command(["git", "init", "--bare", str(bare)])
+            run_git_command(["git", "init", str(seed)])
+            run_git_command(["git", "config", "user.name", "test"], cwd=seed)
+            run_git_command(["git", "config", "user.email", "test@example.com"], cwd=seed)
+            (seed / "README.md").write_text("root\n")
+            run_git_command(["git", "add", "."], cwd=seed)
+            run_git_command(["git", "commit", "-m", "init"], cwd=seed)
+            run_git_command(["git", "branch", "-M", "main"], cwd=seed)
+            run_git_command(["git", "remote", "add", "origin", str(bare)], cwd=seed)
+            run_git_command(["git", "push", "origin", "main"], cwd=seed)
+
+            (local / "sub").mkdir(parents=True)
+            (local / "a.txt").write_text("a")
+            (local / "sub" / "b.txt").write_text("b")
+            env = os.environ.copy()
+            env.update({"GIT_AUTHOR_NAME": "gcp", "GIT_AUTHOR_EMAIL": "gcp@example.com", "GIT_COMMITTER_NAME": "gcp", "GIT_COMMITTER_EMAIL": "gcp@example.com"})
+
+            uploaded, unchanged = _upload_directory_with_git_remote(str(bare), "main", local, "logs", None, env=env)
+
+            self.assertEqual((uploaded, unchanged), (2, 0))
+            run_git_command(["git", "clone", "--quiet", "--branch", "main", str(bare), str(clone)])
+            self.assertEqual((clone / "README.md").read_text(), "root\n")
+            self.assertEqual((clone / "logs" / "a.txt").read_text(), "a")
+            self.assertEqual((clone / "logs" / "sub" / "b.txt").read_text(), "b")
+            commits = run_git_command(["git", "log", "--oneline"], cwd=clone).splitlines()
+            self.assertEqual(len(commits), 2)
+
+            uploaded, unchanged = _upload_directory_with_git_remote(str(bare), "main", local, "logs", None, env=env)
+            self.assertEqual((uploaded, unchanged), (0, 2))
 
     def test_upload_file_skips_unchanged_file_by_git_blob_sha(self):
         class FakeClient:
@@ -146,6 +224,53 @@ class PathTests(unittest.TestCase):
 
             self.assertFalse(changed)
             self.assertEqual(short_sha, "")
+
+    def test_upload_file_reports_large_file_path_and_size(self):
+        class FakeClient:
+            def get_contents(self, repo, path, *, ref=None):
+                raise AssertionError("oversized file should fail before API calls")
+
+            def put_file(self, repo, path, content, *, message, branch=None):
+                raise AssertionError("oversized file should fail before upload")
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "large.bin"
+            with path.open("wb") as f:
+                f.truncate(101 * 1024 * 1024)
+
+            with self.assertRaisesRegex(UserError, r"large\.bin.*101\.0 MiB.*100\.0 MiB"):
+                upload_file_if_changed(FakeClient(), "octo/repo", "main", path, "large.bin", None)
+
+    def test_upload_file_reports_base64_request_size_limit(self):
+        class FakeClient:
+            def get_contents(self, repo, path, *, ref=None):
+                raise AssertionError("oversized request should fail before API calls")
+
+            def put_file(self, repo, path, content, *, message, branch=None):
+                raise AssertionError("oversized request should fail before upload")
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "limit.bin"
+            with path.open("wb") as f:
+                f.truncate(47 * 1024 * 1024)
+
+            with self.assertRaisesRegex(UserError, r"limit\.bin.*47\.0 MiB.*62\.7 MiB after base64.*47\.7 MiB"):
+                upload_file_if_changed(FakeClient(), "octo/repo", "main", path, "limit.bin", None)
+
+    def test_upload_file_adds_path_and_size_to_github_errors(self):
+        class FakeClient:
+            def get_contents(self, repo, path, *, ref=None):
+                raise NotFound("missing")
+
+            def put_file(self, repo, path, content, *, message, branch=None):
+                raise GitHubError("Sorry, the file is too large to be processed.")
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "data.bin"
+            path.write_bytes(b"content")
+
+            with self.assertRaisesRegex(GitHubError, r"data\.bin.*7 B.*Sorry"):
+                upload_file_if_changed(FakeClient(), "octo/repo", "main", path, "data.bin", None)
 
     def test_download_file_falls_back_to_git_blob_api(self):
         content = b"larger than contents inline payload"
@@ -169,6 +294,34 @@ class PathTests(unittest.TestCase):
         self.assertEqual(downloaded, content)
         self.assertEqual(metadata["sha"], sha)
         self.assertEqual(requested_routes, ["/repos/octo/repo/contents/big.log?ref=main", f"/repos/octo/repo/git/blobs/{sha}"])
+
+    def test_request_retries_incomplete_get_response(self):
+        class FakeResponse:
+            def __init__(self, payload=None, error=None):
+                self.payload = payload
+                self.error = error
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                if self.error:
+                    raise self.error
+                return self.payload
+
+        responses = [
+            FakeResponse(error=IncompleteRead(b'{"partial"', 10)),
+            FakeResponse(payload=b'{"ok": true}'),
+        ]
+
+        with patch("gcp.github.urlopen", side_effect=responses) as urlopen_mock:
+            data = GitHubClient("token")._request("GET", "/user")
+
+        self.assertEqual(data, {"ok": True})
+        self.assertEqual(urlopen_mock.call_count, 2)
 
 
 class ConfigTests(unittest.TestCase):
