@@ -131,7 +131,7 @@ def poll_for_access_token(hostname: str, device: DeviceCode, *, timeout: int = 9
             interval += 5
             continue
         if error == "expired_token":
-            raise OAuthError("the one-time code expired; run `uvx gcp setting login --web` again")
+            raise OAuthError("the one-time code expired; run `uvx gitcp setting login --web` again")
         if error == "access_denied":
             raise OAuthError("browser authentication was cancelled")
         description = data.get("error_description") or error or data
@@ -150,7 +150,7 @@ def post_oauth_json(hostname: str, path: str, fields: dict[str, Any]) -> dict[st
         headers={
             "Accept": "application/json",
             "Content-Type": "application/x-www-form-urlencoded",
-            "User-Agent": "gcp/oauth",
+            "User-Agent": "gitcp/oauth",
         },
     )
     try:

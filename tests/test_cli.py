@@ -10,29 +10,29 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
-from gcp.cli import UserError, _upload_directory_with_git_remote, build_remote_path, default_remote_path_for_local, infer_copy_args, iter_local_files, output_path_for, parse_copy_target, resolve_remote_repo, run, upload_directory, upload_file_if_changed
-from gcp.config import load_config, save_config, set_account
-from gcp.github import GitHubClient, GitHubError, NotFound, git_blob_sha
+from gitcp.cli import UserError, _upload_directory_with_git_remote, build_remote_path, default_remote_path_for_local, infer_copy_args, iter_local_files, output_path_for, parse_copy_target, resolve_remote_repo, run, upload_directory, upload_file_if_changed
+from gitcp.config import load_config, save_config, set_account
+from gitcp.github import GitHubClient, GitHubError, NotFound, git_blob_sha
 
 
 @contextmanager
 def isolated_config_dir():
-    old_dir = os.environ.get("GCP_CONFIG_DIR")
-    old_config = os.environ.get("GCP_CONFIG")
+    old_dir = os.environ.get("GITCP_CONFIG_DIR")
+    old_config = os.environ.get("GITCP_CONFIG")
     with tempfile.TemporaryDirectory() as directory:
-        os.environ["GCP_CONFIG_DIR"] = directory
-        os.environ.pop("GCP_CONFIG", None)
+        os.environ["GITCP_CONFIG_DIR"] = directory
+        os.environ.pop("GITCP_CONFIG", None)
         try:
             yield Path(directory)
         finally:
             if old_dir is None:
-                os.environ.pop("GCP_CONFIG_DIR", None)
+                os.environ.pop("GITCP_CONFIG_DIR", None)
             else:
-                os.environ["GCP_CONFIG_DIR"] = old_dir
+                os.environ["GITCP_CONFIG_DIR"] = old_dir
             if old_config is None:
-                os.environ.pop("GCP_CONFIG", None)
+                os.environ.pop("GITCP_CONFIG", None)
             else:
-                os.environ["GCP_CONFIG"] = old_config
+                os.environ["GITCP_CONFIG"] = old_config
 
 
 def run_git_command(args, *, cwd=None, env=None):
@@ -166,7 +166,7 @@ class PathTests(unittest.TestCase):
             self.assertEqual([item[1] for item in client.blobs], [b"a", b"b"])
             self.assertEqual([entry["path"] for entry in client.trees[0][1]], ["logs/a.txt", "logs/sub/b.txt"])
             self.assertEqual(client.trees[0][2], "base123")
-            self.assertEqual(client.commits, [("octo/repo", "gcp: sync logs", "tree123", ["head123"])])
+            self.assertEqual(client.commits, [("octo/repo", "gitcp: sync logs", "tree123", ["head123"])])
             self.assertEqual(client.ref_updates, [("octo/repo", "heads/main", "commit123", False)])
 
     @unittest.skipIf(shutil.which("git") is None, "git is required")
@@ -193,9 +193,9 @@ class PathTests(unittest.TestCase):
             (local / "a.txt").write_text("a")
             (local / "sub" / "b.txt").write_text("b")
             env = os.environ.copy()
-            env.update({"GIT_AUTHOR_NAME": "gcp", "GIT_AUTHOR_EMAIL": "gcp@example.com", "GIT_COMMITTER_NAME": "gcp", "GIT_COMMITTER_EMAIL": "gcp@example.com"})
+            env.update({"GIT_AUTHOR_NAME": "gitcp", "GIT_AUTHOR_EMAIL": "gitcp@example.com", "GIT_COMMITTER_NAME": "gitcp", "GIT_COMMITTER_EMAIL": "gitcp@example.com"})
 
-            with patch.dict(os.environ, {"GCP_CACHE_DIR": str(root / "cache")}):
+            with patch.dict(os.environ, {"GITCP_CACHE_DIR": str(root / "cache")}):
                 uploaded, unchanged = _upload_directory_with_git_remote(str(bare), "main", local, "logs", None, env=env)
 
                 self.assertEqual((uploaded, unchanged), (2, 0))
@@ -206,7 +206,7 @@ class PathTests(unittest.TestCase):
                 commits = run_git_command(["git", "log", "--oneline"], cwd=clone).splitlines()
                 self.assertEqual(len(commits), 2)
 
-                with patch("gcp.cli._git_hash_uploads", side_effect=AssertionError("cached sync should not hash file contents")):
+                with patch("gitcp.cli._git_hash_uploads", side_effect=AssertionError("cached sync should not hash file contents")):
                     uploaded, unchanged = _upload_directory_with_git_remote(str(bare), "main", local, "logs", None, env=env)
                 self.assertEqual((uploaded, unchanged), (0, 2))
 
@@ -319,7 +319,7 @@ class PathTests(unittest.TestCase):
             FakeResponse(payload=b'{"ok": true}'),
         ]
 
-        with patch("gcp.github.urlopen", side_effect=responses) as urlopen_mock:
+        with patch("gitcp.github.urlopen", side_effect=responses) as urlopen_mock:
             data = GitHubClient("token")._request("GET", "/user")
 
         self.assertEqual(data, {"ok": True})
@@ -352,7 +352,7 @@ class ConfigTests(unittest.TestCase):
 
 class CliTests(unittest.TestCase):
     def test_status_without_config(self):
-        with isolated_config_dir(), patch.dict(os.environ, {"GCP_TOKEN": "", "GH_TOKEN": "", "GITHUB_TOKEN": ""}, clear=False):
+        with isolated_config_dir(), patch.dict(os.environ, {"GITCP_TOKEN": "", "GH_TOKEN": "", "GITHUB_TOKEN": ""}, clear=False):
             output = StringIO()
             with redirect_stdout(output):
                 code = run(["status"])
@@ -413,7 +413,7 @@ class CliTests(unittest.TestCase):
         with redirect_stdout(output):
             code = run(["--help"])
         self.assertEqual(code, 0)
-        self.assertIn("uvx gcp LOCAL_FILE_OR_DIR :REMOTE_PATH", output.getvalue())
+        self.assertIn("uvx gitcp LOCAL_FILE_OR_DIR :REMOTE_PATH", output.getvalue())
 
 
 if __name__ == "__main__":

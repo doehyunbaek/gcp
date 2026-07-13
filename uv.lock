@@ -3,6 +3,6 @@ revision = 3
 requires-python = ">=3.9"
 
 [[package]]
-name = "gcp"
-version = "0.3.0"
+name = "gitcp"
+version = "0.3.1"
 source = { editable = "." }

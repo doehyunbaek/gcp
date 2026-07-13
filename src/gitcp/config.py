@@ -6,17 +6,17 @@ import stat
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
 
-APP_NAME = "gcp"
+APP_NAME = "gitcp"
 DEFAULT_HOST = "github.com"
 DEFAULT_BRANCH = "main"
 CONFIG_VERSION = 1
-CONFIG_ENV = "GCP_CONFIG"
-CONFIG_DIR_ENV = "GCP_CONFIG_DIR"
-TOKEN_ENV_VARS = ("GCP_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
+CONFIG_ENV = "GITCP_CONFIG"
+CONFIG_DIR_ENV = "GITCP_CONFIG_DIR"
+TOKEN_ENV_VARS = ("GITCP_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
 
 
 class ConfigError(RuntimeError):
-    """Raised when the local gcp configuration cannot be read or written."""
+    """Raised when the local gitcp configuration cannot be read or written."""
 
 
 def config_dir() -> Path:

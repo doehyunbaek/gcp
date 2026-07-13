@@ -64,7 +64,7 @@ class GitHubClient:
         headers = {
             "Accept": "application/vnd.github+json",
             "Authorization": f"Bearer {self.token}",
-            "User-Agent": f"gcp/{__version__}",
+            "User-Agent": f"gitcp/{__version__}",
             "X-GitHub-Api-Version": "2022-11-28",
         }
         if body is not None:

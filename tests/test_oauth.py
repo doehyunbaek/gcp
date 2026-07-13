@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from gcp.oauth import DeviceCode, OAuthError, oauth_base, poll_for_access_token, request_device_code
+from gitcp.oauth import DeviceCode, OAuthError, oauth_base, poll_for_access_token, request_device_code
 
 
 class OAuthTests(unittest.TestCase):
@@ -12,7 +12,7 @@ class OAuthTests(unittest.TestCase):
         self.assertEqual(oauth_base("ghe.example.com"), "https://ghe.example.com")
 
     def test_request_device_code(self):
-        with patch("gcp.oauth.post_oauth_json") as post:
+        with patch("gitcp.oauth.post_oauth_json") as post:
             post.return_value = {
                 "device_code": "device",
                 "user_code": "ABCD-EFGH",
@@ -28,14 +28,14 @@ class OAuthTests(unittest.TestCase):
 
     def test_poll_handles_authorization_pending_then_success(self):
         device = DeviceCode("device", "ABCD", "https://github.com/login/device", 900, 1)
-        with patch("gcp.oauth.time.sleep"), patch("gcp.oauth.post_oauth_json") as post:
+        with patch("gitcp.oauth.time.sleep"), patch("gitcp.oauth.post_oauth_json") as post:
             post.side_effect = [{"error": "authorization_pending"}, {"access_token": "token"}]
             token = poll_for_access_token("github.com", device, timeout=30)
         self.assertEqual(token, "token")
 
     def test_poll_expired_token(self):
         device = DeviceCode("device", "ABCD", "https://github.com/login/device", 900, 1)
-        with patch("gcp.oauth.time.sleep"), patch("gcp.oauth.post_oauth_json") as post:
+        with patch("gitcp.oauth.time.sleep"), patch("gitcp.oauth.post_oauth_json") as post:
             post.return_value = {"error": "expired_token"}
             with self.assertRaises(OAuthError):
                 poll_for_access_token("github.com", device, timeout=30)

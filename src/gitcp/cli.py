@@ -41,11 +41,11 @@ GITHUB_CONTENTS_MAX_REQUEST_SIZE = 50 * 1000 * 1000
 HELP = """GitHub-backed file sync.
 
 Usage:
-  uvx gcp setting [login|logout|status|repo|branch] [options]
-  uvx gcp FILE_OR_DIR [options]
-  uvx gcp LOCAL_FILE_OR_DIR :REMOTE_PATH [options]
-  uvx gcp :REMOTE_PATH LOCAL_FILE [options]
-  uvx gcp status
+  uvx gitcp setting [login|logout|status|repo|branch] [options]
+  uvx gitcp FILE_OR_DIR [options]
+  uvx gitcp LOCAL_FILE_OR_DIR :REMOTE_PATH [options]
+  uvx gitcp :REMOTE_PATH LOCAL_FILE [options]
+  uvx gitcp status
 
 Commands:
   setting          Configure GitHub auth and the target repository
@@ -58,11 +58,11 @@ Remote paths:
   github:path, gh:path  Aliases for :path
 
 Examples:
-  uvx gcp README.md
-  uvx gcp README.md :README.md
-  uvx gcp :README.md README.md
+  uvx gitcp README.md
+  uvx gitcp README.md :README.md
+  uvx gitcp :README.md README.md
 
-Run `uvx gcp <command> --help` for command options.
+Run `uvx gitcp <command> --help` for command options.
 """
 
 
@@ -129,7 +129,7 @@ def run(argv: list[str]) -> int:
 
 
 def run_copy(argv: list[str]) -> int:
-    parser = command_parser(prog="gcp", description="Copy files between local disk and a configured GitHub repository.")
+    parser = command_parser(prog="gitcp", description="Copy files between local disk and a configured GitHub repository.")
     parser.add_argument("source", help="Source path. Use :path, repo:path, or owner/repo:path for GitHub")
     parser.add_argument("destination", nargs="?", help="Destination path. Use :path, repo:path, or owner/repo:path for GitHub")
     add_context_flags(parser)
@@ -184,7 +184,7 @@ def run_copy(argv: list[str]) -> int:
 
 
 def run_status(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="gcp status", description="Show current gcp settings.")
+    parser = argparse.ArgumentParser(prog="gitcp status", description="Show current gitcp settings.")
     parser.add_argument("--show-token", action="store_true", help="Show whether a stored token exists (never prints token values)")
     args = parser.parse_args(argv)
     print_status(load_config(), show_token=args.show_token)
@@ -192,7 +192,7 @@ def run_status(argv: list[str]) -> int:
 
 
 def run_setting(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="gcp setting", description="Configure GitHub auth and sync settings.")
+    parser = argparse.ArgumentParser(prog="gitcp setting", description="Configure GitHub auth and sync settings.")
     subparsers = parser.add_subparsers(dest="action")
 
     login = subparsers.add_parser("login", help="Log in to a GitHub account", add_help=False)
@@ -204,7 +204,7 @@ def run_setting(argv: list[str]) -> int:
     login.add_argument("--web", "-w", action="store_true", help="Login with a web browser")
     login.add_argument("--clipboard", "-c", action="store_true", help="Copy one-time OAuth device code to clipboard")
     login.add_argument("--with-token", action="store_true", help="Read a GitHub token from standard input")
-    login.add_argument("--use-env-token", action="store_true", help="Use GCP_TOKEN, GH_TOKEN, or GITHUB_TOKEN instead of storing a token")
+    login.add_argument("--use-env-token", action="store_true", help="Use GITCP_TOKEN, GH_TOKEN, or GITHUB_TOKEN instead of storing a token")
 
     logout = subparsers.add_parser("logout", help="Log out of a GitHub account", add_help=False)
     add_long_help(logout)
@@ -383,7 +383,7 @@ def setting_branch(args: argparse.Namespace) -> int:
     account = get_user(config, host, user) if user else None
 
     if account is None:
-        hint = "run `uvx gcp setting` first"
+        hint = "run `uvx gitcp setting` first"
         if requested_host:
             raise UserError(f"not logged in to {host}; {hint}")
         raise UserError(f"not logged in; {hint}")
@@ -460,14 +460,14 @@ def read_login_token(args: argparse.Namespace, host: str) -> tuple[str, str, str
         return token, "config", ""
     if args.use_env_token:
         if not env_value:
-            raise UserError("no token found in GCP_TOKEN, GH_TOKEN, or GITHUB_TOKEN")
+            raise UserError("no token found in GITCP_TOKEN, GH_TOKEN, or GITHUB_TOKEN")
         return env_value, "env", ""
 
     if can_prompt():
         choices = ["Login with a web browser", "Paste an authentication token"]
         if env_value:
             choices.append(f"Use token from ${env_name} without storing it")
-        selected = select("How would you like to authenticate gcp?", choices)
+        selected = select("How would you like to authenticate gitcp?", choices)
         if selected == 0:
             token, username = login_with_browser(host, interactive=True, copy_to_clipboard=bool(args.clipboard))
             print("✓ Authentication complete.", file=sys.stderr)
@@ -481,7 +481,7 @@ def read_login_token(args: argparse.Namespace, host: str) -> tuple[str, str, str
 
     if env_value:
         return env_value, "env", ""
-    raise UserError("no token available; run interactively, pass --web, pass --with-token, or set GCP_TOKEN/GH_TOKEN/GITHUB_TOKEN")
+    raise UserError("no token available; run interactively, pass --web, pass --with-token, or set GITCP_TOKEN/GH_TOKEN/GITHUB_TOKEN")
 
 
 def resolve_context(
@@ -504,7 +504,7 @@ def resolve_context(
         if allow_env_without_account and env_value and repo_arg:
             branch_arg = getattr(args, "branch", None) or DEFAULT_BRANCH
             return SyncContext(host, env_name or "env", env_value, repo_arg, branch_arg, "", "env", {})
-        hint = "run `uvx gcp setting` first"
+        hint = "run `uvx gitcp setting` first"
         if requested_host:
             raise UserError(f"not logged in to {host}; {hint}")
         raise UserError(f"not logged in; {hint}")
@@ -516,11 +516,11 @@ def resolve_context(
             token = env_value
             token_source = "env"
         else:
-            raise UserError("no token available; set GCP_TOKEN/GH_TOKEN/GITHUB_TOKEN or run `uvx gcp setting login --with-token`")
+            raise UserError("no token available; set GITCP_TOKEN/GH_TOKEN/GITHUB_TOKEN or run `uvx gitcp setting login --with-token`")
 
     repo = getattr(args, "repo", None) or account.get("repo") or ""
     if require_repo and not repo:
-        raise UserError("no repository configured; run `uvx gcp setting repo --repo owner/repo`")
+        raise UserError("no repository configured; run `uvx gitcp setting repo --repo owner/repo`")
     if repo:
         parse_repo(str(repo))
 
@@ -542,7 +542,7 @@ def print_status(config: dict[str, Any], *, show_token: bool) -> None:
 
     configured_hosts = list(hosts(config))
     if not configured_hosts:
-        print("Not logged in. Run `uvx gcp setting` to configure GitHub access.")
+        print("Not logged in. Run `uvx gitcp setting` to configure GitHub access.")
         return
 
     current_host = normalize_host(config.get("current_host") or DEFAULT_HOST)
@@ -688,7 +688,7 @@ def _upload_directory_with_git_remote(
     cache_path = _git_upload_cache_path(remote_url, branch, local_dir, remote_dir)
     cache = _load_git_hash_cache(cache_path)
 
-    with tempfile.TemporaryDirectory(prefix="gcp-git-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="gitcp-git-") as tmp:
         repo_dir = Path(tmp)
         _progress(show_progress, f"preparing git push for {len(candidates)} file(s), {_format_size(total_size)}")
         _run_git(["init", "--quiet"], repo_dir, git_env)
@@ -732,7 +732,7 @@ def _upload_directory_with_git_remote(
         if not tree_sha:
             raise GitHubError("git did not return a tree sha")
         commit_sha = _run_git(
-            ["commit-tree", tree_sha, "-p", head_sha, "-m", message or f"gcp: sync {remote_dir or local_dir.name}"],
+            ["commit-tree", tree_sha, "-p", head_sha, "-m", message or f"gitcp: sync {remote_dir or local_dir.name}"],
             repo_dir,
             git_env,
         ).strip()
@@ -796,7 +796,7 @@ def _upload_directory_with_api(
             raise GitHubError("GitHub did not return a tree sha")
         commit = client.create_commit(
             remote_repo,
-            message or f"gcp: sync {remote_dir or local_dir.name}",
+            message or f"gitcp: sync {remote_dir or local_dir.name}",
             tree_sha,
             [head_sha],
         )
@@ -849,8 +849,8 @@ def _git_env(token: str) -> dict[str, str]:
 
 def _git_env_with_identity(env: dict[str, str]) -> dict[str, str]:
     env = env.copy()
-    env.setdefault("GIT_AUTHOR_NAME", "gcp")
-    env.setdefault("GIT_AUTHOR_EMAIL", "gcp@localhost")
+    env.setdefault("GIT_AUTHOR_NAME", "gitcp")
+    env.setdefault("GIT_AUTHOR_EMAIL", "gitcp@localhost")
     env.setdefault("GIT_COMMITTER_NAME", env["GIT_AUTHOR_NAME"])
     env.setdefault("GIT_COMMITTER_EMAIL", env["GIT_AUTHOR_EMAIL"])
     env.setdefault("GIT_TERMINAL_PROMPT", "0")
@@ -887,16 +887,16 @@ def _run_git(
 
 def _progress(enabled: bool, message: str) -> None:
     if enabled:
-        print(f"gcp: {message}...", file=sys.stderr)
+        print(f"gitcp: {message}...", file=sys.stderr)
 
 
-def _gcp_cache_dir() -> Path:
-    override = os.environ.get("GCP_CACHE_DIR")
+def _gitcp_cache_dir() -> Path:
+    override = os.environ.get("GITCP_CACHE_DIR")
     if override:
         return Path(override).expanduser()
     xdg_cache = os.environ.get("XDG_CACHE_HOME")
     base = Path(xdg_cache).expanduser() if xdg_cache else Path.home() / ".cache"
-    return base / "gcp"
+    return base / "gitcp"
 
 
 def _git_upload_cache_path(remote_url: str, branch: str, local_dir: Path, remote_dir: str) -> Path:
@@ -910,7 +910,7 @@ def _git_upload_cache_path(remote_url: str, branch: str, local_dir: Path, remote
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
-    return _gcp_cache_dir() / "upload-hashes" / f"{hashlib.sha256(key_data).hexdigest()}.json"
+    return _gitcp_cache_dir() / "upload-hashes" / f"{hashlib.sha256(key_data).hexdigest()}.json"
 
 
 def _load_git_hash_cache(path: Path) -> dict[str, Any]:
@@ -1137,7 +1137,7 @@ def upload_file_if_changed(
             remote_repo,
             remote_path,
             local_content,
-            message=message or f"gcp: sync {remote_path}",
+            message=message or f"gitcp: sync {remote_path}",
             branch=branch,
         )
     except GitHubError as e:
